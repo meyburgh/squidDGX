@@ -736,4 +736,25 @@ cudaError_t adaptive_graph_instantiate(AdaptiveGraph* graph);
 cudaError_t adaptive_graph_launch(AdaptiveGraph* graph, cudaStream_t stream);
 void adaptive_graph_destroy(AdaptiveGraph* graph);
 
+// --- Inkling-2-Mini Vision Encoder (kernels_vision.cu) ---
+
+// Encode one preprocessed image's BF16 spatial-merge patches [grid_rows*grid_cols*4, 1200]
+// into FP32 LLM embeddings [grid_rows*grid_cols, HIDDEN].
+void launch_vision_encode(
+    const VisionWeights& vw,
+    const __nv_bfloat16* d_patches,
+    int grid_rows,
+    int grid_cols,
+    float* d_out_embeds,
+    cudaStream_t stream);
+
+// Scatter encoded vision embeddings into LLM hidden states after embed_norm.
+void launch_scatter_vision_embeds(
+    float* hidden,
+    const float* vis_embeds,
+    const int32_t* d_dst_rows,
+    const int32_t* d_src_rows,
+    int n_slots,
+    cudaStream_t stream);
+
 } // namespace squid

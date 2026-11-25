@@ -37,6 +37,23 @@ constexpr int INTERMEDIATE = 1152;
 constexpr int VOCAB_PADDED = 201024;
 constexpr int VOCAB_UNPADDED = 200058;
 constexpr int EOS_TOKEN = 200006;
+constexpr int IMAGE_TOKEN_ID = 200054; // <|unused_200054|>
+
+// Inkling-2-Mini Vision Encoder (inkling2_vision) constants
+constexpr int VIS_HIDDEN = 1024;
+constexpr int VIS_LAYERS = 23;
+constexpr int VIS_HEADS = 16;
+constexpr int VIS_HEAD_DIM = 64;
+constexpr int VIS_INTERMEDIATE = 4096;
+constexpr int VIS_PATCH_SIZE = 20;
+constexpr int VIS_MERGE_SIZE = 2;
+constexpr int VIS_TILE_SIZE = VIS_PATCH_SIZE * VIS_MERGE_SIZE; // 40
+constexpr int VIS_PATCH_DIM = VIS_PATCH_SIZE * VIS_PATCH_SIZE * 3; // 1200
+constexpr int VIS_POSEMB_GRID = 32;
+constexpr int VIS_PROJ_HIDDEN = 4096;
+constexpr float VIS_LN_EPS = 1e-5f;
+constexpr float VIS_ROPE_THETA = 10000.0f;
+constexpr int VIS_MAX_TOKENS_PER_IMG = 4096; // up to 16,384 ViT patches (2560x2560 native)
 
 constexpr uint64_t VRAM_ALIGNMENT = 256;
 constexpr int QRGS_OUT_DIM = Q_DIM + R_DIM + Q_DIM + NUM_HEADS; // 6552

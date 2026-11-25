@@ -33,6 +33,7 @@ constexpr size_t kPromptTokensMax = 1048576;
 constexpr size_t kStopSequencesMax = 8;
 constexpr size_t kStopSequenceMaxBytes = 64;
 constexpr size_t kToolCallsMax = 16;
+constexpr size_t kMaxImagesPerRequest = 16;
 
 std::atomic<bool> g_stop_requested{false};
 std::atomic<int> g_listen_fd{-1};
@@ -673,10 +674,21 @@ bool resolve_tool_name_by_id(std::string_view prior_prefix, std::string_view tar
     return false;
 }
 
+struct RequestImages {
+    PreprocessedImage items[kMaxImagesPerRequest]{};
+    size_t count = 0;
+
+    ~RequestImages() {
+        for (size_t i = 0; i < count; ++i) items[i].deinit();
+        count = 0;
+    }
+};
+
 struct ChatEncodeResult {
     size_t prompt_len = 0;
     uint32_t system_prefix_tokens = 0;
     bool overflow = false;
+    bool image_error = false;
 };
 
 ChatEncodeResult encode_chat_template_zero_alloc(
@@ -686,9 +698,11 @@ ChatEncodeResult encode_chat_template_zero_alloc(
     std::string_view effort,
     bool keep_history_thinking,
     bool enable_thinking,
-    ServerBuffers& buffers) {
+    ServerBuffers& buffers,
+    RequestImages& images) {
     size_t out_len = 0;
     bool overflow = false;
+    bool image_error = false;
     char* scratch = buffers.scratch_str_buf;
 
     if (json_array_has_items(tools_json)) {
@@ -832,14 +846,56 @@ ChatEncodeResult encode_chat_template_zero_alloc(
                     } else if (c_raw[ap] == '{') {
                         const size_t ps_start = ap;
                         skip_json_value(c_raw, ap);
-                        std::string_view ts;
-                        if (extract_string_field(c_raw.substr(ps_start, ap - ps_start), "text", scratch, kScratchStringBytes, &ts)) {
+                        const std::string_view part_obj = c_raw.substr(ps_start, ap - ps_start);
+                        char ptype_buf[32];
+                        std::string_view ptype;
+                        const bool has_ptype = extract_string_field(part_obj, "type", ptype_buf, sizeof(ptype_buf), &ptype);
+                        if (has_ptype && (ptype == "image_url" || ptype == "image" || ptype == "input_image")) {
+                            std::string_view img_src;
+                            std::string_view iu_raw;
+                            if (extract_raw_field(part_obj, "image_url", &iu_raw)) {
+                                if (!iu_raw.empty() && iu_raw[0] == '{') {
+                                    (void)extract_string_field(iu_raw, "url", scratch, kScratchStringBytes, &img_src);
+                                } else if (!iu_raw.empty() && iu_raw[0] == '"') {
+                                    size_t ip = 0;
+                                    (void)parse_json_string(iu_raw, ip, scratch, kScratchStringBytes, &img_src);
+                                }
+                            }
+                            if (img_src.empty()) {
+                                (void)extract_string_field(part_obj, "image", scratch, kScratchStringBytes, &img_src);
+                            }
+                            if (img_src.empty()) {
+                                (void)extract_string_field(part_obj, "url", scratch, kScratchStringBytes, &img_src);
+                            }
+                            if (img_src.empty() || images.count >= kMaxImagesPerRequest ||
+                                !preprocess_image_source(img_src, images.items[images.count])) {
+                                image_error = true;
+                                break;
+                            }
+                            const int n_img_toks = images.items[images.count].num_tokens;
+                            ++images.count;
                             emitted_assistant_block = true;
                             append_encoded_segment(tokenizer, role_tok, true, buffers, out_len, overflow);
                             if (has_resolved_name) append_encoded_segment(tokenizer, resolved_name, false, buffers, out_len, overflow);
-                            append_encoded_segment(tokenizer, "<|content_text|>", true, buffers, out_len, overflow);
-                            append_encoded_segment(tokenizer, ts, false, buffers, out_len, overflow);
+                            append_encoded_segment(tokenizer, "<|content_image|>", true, buffers, out_len, overflow);
+                            if (out_len + static_cast<size_t>(n_img_toks) > kPromptTokensMax) {
+                                overflow = true;
+                            } else {
+                                for (int it = 0; it < n_img_toks; ++it) {
+                                    buffers.prompt_tokens[out_len++] = IMAGE_TOKEN_ID;
+                                }
+                            }
                             append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, out_len, overflow);
+                        } else {
+                            std::string_view ts;
+                            if (extract_string_field(part_obj, "text", scratch, kScratchStringBytes, &ts)) {
+                                emitted_assistant_block = true;
+                                append_encoded_segment(tokenizer, role_tok, true, buffers, out_len, overflow);
+                                if (has_resolved_name) append_encoded_segment(tokenizer, resolved_name, false, buffers, out_len, overflow);
+                                append_encoded_segment(tokenizer, "<|content_text|>", true, buffers, out_len, overflow);
+                                append_encoded_segment(tokenizer, ts, false, buffers, out_len, overflow);
+                                append_encoded_segment(tokenizer, "<|end_message|>", true, buffers, out_len, overflow);
+                            }
                         }
                     } else {
                         skip_json_value(c_raw, ap);
@@ -919,7 +975,7 @@ ChatEncodeResult encode_chat_template_zero_alloc(
     if (!enable_thinking && !overflow) {
         append_encoded_segment(tokenizer, "<|message_model|><|content_text|>", true, buffers, out_len, overflow);
     }
-    return {out_len, system_prefix_tokens, overflow};
+    return {out_len, system_prefix_tokens, overflow, image_error};
 }
 
 struct ParsedHttp {
@@ -1142,8 +1198,13 @@ void handle_chat_completions(
     if (req_top_k < 0) req_top_k = 0;
     req_mtp = std::clamp(req_mtp, 0, MTP_MAX_DRAFTS);
 
+    RequestImages req_images{};
     const ChatEncodeResult enc = encode_chat_template_zero_alloc(
-        tokenizer, messages_json, tools_json, effort, config.keep_history_thinking, enable_thinking, buffers);
+        tokenizer, messages_json, tools_json, effort, config.keep_history_thinking, enable_thinking, buffers, req_images);
+    if (enc.image_error) {
+        send_error_json(fd, 400, "Failed to fetch or decode image input (or exceeded 16 images)", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+        return;
+    }
     if (enc.overflow) {
         send_error_json(fd, 413, "Rendered prompt exceeds static buffer or max_context", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
         return;
@@ -1151,6 +1212,27 @@ void handle_chat_completions(
     if (enc.prompt_len == 0 || enc.prompt_len >= config.context_tokens_max) {
         send_error_json(fd, 400, "Prompt empty or exceeds max_context", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
         return;
+    }
+
+    struct VisionEmbedsGuard {
+        float* ptr = nullptr;
+        ~VisionEmbedsGuard() {
+            if (ptr) CUDA_CHECK(cudaFree(ptr));
+        }
+    } vis_guard{};
+    Engine::VisionInput vision_in{};
+    if (req_images.count > 0) {
+        if (!engine.model || !engine.model->mw.vision.loaded) {
+            send_error_json(fd, 400, "Loaded checkpoint does not include vision encoder weights", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+            return;
+        }
+        size_t total_vis_toks = 0;
+        vis_guard.ptr = engine.encode_images(req_images.items, req_images.count, &total_vis_toks);
+        if (!vis_guard.ptr || total_vis_toks == 0) {
+            send_error_json(fd, 500, "Vision encoder failed to produce image embeddings", "server_error", buffers.response_buf, kResponseBufferBytes);
+            return;
+        }
+        vision_in = {vis_guard.ptr, total_vis_toks};
     }
     const uint32_t gen_limit = std::min<uint32_t>(static_cast<uint32_t>(max_tokens),
                                                   config.context_tokens_max - static_cast<uint32_t>(enc.prompt_len));
@@ -1198,7 +1280,7 @@ void handle_chat_completions(
 
         const GenerateStats stats = engine.generate_with_hint(
             buffers.prompt_tokens, enc.prompt_len, enc.system_prefix_tokens,
-            gen_limit, static_cast<uint32_t>(req_mtp), nullptr, 0, NonStreamCtx::on_token, &ctx);
+            gen_limit, static_cast<uint32_t>(req_mtp), nullptr, 0, NonStreamCtx::on_token, &ctx, vision_in);
 
         const bool hit_eos = (stats.last_token_id == EOS_TOKEN);
         const char* finish_reason = (parser.tool_call_count > 0) ? "tool_calls"
@@ -1244,7 +1326,7 @@ void handle_chat_completions(
         ok = ok && bw.try_append_slice("},\"finish_reason\":");
         ok = ok && bw.try_append_json_escaped(finish_reason);
         ok = ok && bw.try_append_fmt(
-            "}}],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u,\"prompt_tokens_details\":{\"cached_tokens\":%u}},"
+            "}],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u,\"prompt_tokens_details\":{\"cached_tokens\":%u}},"
             "\"timings\":{\"prefill_ms\":%.2f,\"decode_ms\":%.2f,\"tokens_per_second\":%.2f,\"cached_tokens\":%u,\"spec_acc_pct\":%.1f,\"spec_dl\":%.2f}}",
             stats.prompt_tokens, stats.generated_tokens, stats.prompt_tokens + stats.generated_tokens, stats.cached_tokens,
             stats.prefill_ms, stats.decode_ms, tps, stats.cached_tokens, acc_pct, dl);
@@ -1323,7 +1405,7 @@ void handle_chat_completions(
 
     const GenerateStats stats = engine.generate_with_hint(
         buffers.prompt_tokens, enc.prompt_len, enc.system_prefix_tokens,
-        gen_limit, static_cast<uint32_t>(req_mtp), nullptr, 0, StreamCtx::on_token, &sctx);
+        gen_limit, static_cast<uint32_t>(req_mtp), nullptr, 0, StreamCtx::on_token, &sctx, vision_in);
     if (!sctx.conn_ok) return;
 
     if (stops.count > 0 && !sctx.hit_stop && sctx.emitted_len < parser.content_writer.length) {
@@ -1503,7 +1585,7 @@ void handle_text_completions(
         ok = ok && bw.try_append_slice(",\"logprobs\":null,\"finish_reason\":");
         ok = ok && bw.try_append_json_escaped((cctx.hit_stop || hit_eos) ? "stop" : "length");
         ok = ok && bw.try_append_fmt(
-            "}}],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u},"
+            "}],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u},"
             "\"timings\":{\"prefill_ms\":%.2f,\"decode_ms\":%.2f,\"tokens_per_second\":%.2f}}",
             stats.prompt_tokens, stats.generated_tokens, stats.prompt_tokens + stats.generated_tokens,
             stats.prefill_ms, stats.decode_ms, tps);

@@ -195,6 +195,7 @@ uint64_t compute_total_vram_bytes(
     WeightKind dense_kind,
     WeightKind mtp_kind,
     bool has_mtp,
+    bool has_vision,
     bool has_pruned_draft_vocab,
     uint32_t draft_vocab_count,
     bool has_ablation,
@@ -303,6 +304,27 @@ uint64_t compute_total_vram_bytes(
             total += linear_weight_vram_bytes(2 * MTP_INTERMEDIATE, HIDDEN, mtp_kind);
             total += linear_weight_vram_bytes(HIDDEN, MTP_INTERMEDIATE, mtp_kind);
             total += linear_weight_vram_bytes(2 * KV_DIM, HIDDEN, mtp_kind);
+        }
+    }
+
+    if (has_vision) {
+        total += align_up_u64(static_cast<uint64_t>(VIS_HIDDEN) * 2, a); // class_embedding
+        total += align_up_u64(static_cast<uint64_t>(VIS_HIDDEN) * 2, a); // cls_position_embedding
+        total += align_up_u64(static_cast<uint64_t>(VIS_HIDDEN) * VIS_PATCH_DIM * 2, a); // patch_embedding
+        total += align_up_u64(static_cast<uint64_t>(VIS_POSEMB_GRID * VIS_POSEMB_GRID) * VIS_HIDDEN * 2, a); // position_embedding
+        total += 2 * align_up_u64(static_cast<uint64_t>(VIS_HIDDEN) * 2, a); // ln_pre_w, ln_pre_b
+        total += align_up_u64(static_cast<uint64_t>(VIS_PROJ_HIDDEN) * (VIS_MERGE_SIZE * VIS_MERGE_SIZE * VIS_HIDDEN) * 2, a); // proj_in
+        total += align_up_u64(static_cast<uint64_t>(HIDDEN) * VIS_PROJ_HIDDEN * 2, a); // proj_out
+        for (int vl = 0; vl < VIS_LAYERS; ++vl) {
+            total += 6 * align_up_u64(static_cast<uint64_t>(VIS_HIDDEN) * 2, a); // ln_1_{w,b}, ln_2_{w,b}, ls_1, ls_2
+            total += align_up_u64(static_cast<uint64_t>(3 * VIS_HIDDEN) * VIS_HIDDEN * 2, a); // qkv_w
+            total += align_up_u64(static_cast<uint64_t>(3 * VIS_HIDDEN) * 2, a); // qkv_b
+            total += align_up_u64(static_cast<uint64_t>(VIS_HIDDEN) * VIS_HIDDEN * 2, a); // out_proj_w
+            total += align_up_u64(static_cast<uint64_t>(VIS_HIDDEN) * 2, a); // out_proj_b
+            total += align_up_u64(static_cast<uint64_t>(VIS_INTERMEDIATE) * VIS_HIDDEN * 2, a); // c_fc_w
+            total += align_up_u64(static_cast<uint64_t>(VIS_INTERMEDIATE) * 2, a); // c_fc_b
+            total += align_up_u64(static_cast<uint64_t>(VIS_HIDDEN) * VIS_INTERMEDIATE * 2, a); // c_proj_w
+            total += align_up_u64(static_cast<uint64_t>(VIS_HIDDEN) * 2, a); // c_proj_b
         }
     }
 
@@ -612,8 +634,10 @@ bool LoadedModel::load(
         has_pruned_draft_vocab = try_load_draft_vocab(model_directory, quant_mode, &draft_vocab_host, &draft_vocab_count);
     }
 
+    const bool has_vision = (sf_main.lookup_optional("model.visual.proj_out.weight") != nullptr);
+
     const uint64_t total_vram_bytes = compute_total_vram_bytes(
-        quant_mode, dense_kind, mtp_kind, has_mtp,
+        quant_mode, dense_kind, mtp_kind, has_mtp, has_vision,
         has_pruned_draft_vocab, draft_vocab_count, has_ablation, has_ablation_detectors);
     constexpr uint64_t kStageBytes = 96ULL * 1024 * 1024;
     const uint64_t fold_temp_bytes = has_mtp ? (static_cast<uint64_t>(draft_vocab_count) * MTP_MARKOV_RANK * 2 + 2ULL * 1024 * 1024) : 0;
@@ -984,6 +1008,63 @@ bool LoadedModel::load(
         mw.dspark.loaded = true;
     }
 
+    // --- Inkling-2-Mini Vision Encoder Weights (BF16) ---
+    if (has_vision) {
+        VisionWeights& vw = mw.vision;
+        vw.class_embedding = upload_bf16(arena, up, sf_main, "model.visual.backbone.embeddings.class_embedding", VIS_HIDDEN);
+        vw.cls_position_embedding = upload_bf16(arena, up, sf_main, "model.visual.backbone.embeddings.cls_position_embedding", VIS_HIDDEN);
+        vw.patch_embedding = upload_bf16(arena, up, sf_main, "model.visual.backbone.embeddings.patch_embedding.weight", static_cast<uint64_t>(VIS_HIDDEN) * VIS_PATCH_DIM);
+        vw.position_embedding = upload_bf16(arena, up, sf_main, "model.visual.backbone.embeddings.position_embedding", static_cast<uint64_t>(VIS_POSEMB_GRID * VIS_POSEMB_GRID) * VIS_HIDDEN);
+        vw.ln_pre_w = upload_bf16(arena, up, sf_main, "model.visual.backbone.ln_pre.weight", VIS_HIDDEN);
+        vw.ln_pre_b = upload_bf16(arena, up, sf_main, "model.visual.backbone.ln_pre.bias", VIS_HIDDEN);
+        vw.proj_in = upload_bf16(arena, up, sf_main, "model.visual.proj_in.weight", static_cast<uint64_t>(VIS_PROJ_HIDDEN) * (VIS_MERGE_SIZE * VIS_MERGE_SIZE * VIS_HIDDEN));
+        vw.proj_out = upload_bf16(arena, up, sf_main, "model.visual.proj_out.weight", static_cast<uint64_t>(HIDDEN) * VIS_PROJ_HIDDEN);
+
+        auto upload_vis_layer = [&](int vl, const char* suffix, uint64_t elems) -> __nv_bfloat16* {
+            int n = std::snprintf(name_buf, sizeof(name_buf), "model.visual.backbone.layers.%d.%s", vl, suffix);
+            SQUID_ASSERT(n > 0 && static_cast<size_t>(n) < sizeof(name_buf));
+            return upload_bf16(arena, up, sf_main, std::string_view(name_buf, static_cast<size_t>(n)), elems);
+        };
+        auto upload_vis_raw = [&](int vl, const char* suffix, void* dst, uint64_t bytes) {
+            int n = std::snprintf(name_buf, sizeof(name_buf), "model.visual.backbone.layers.%d.%s", vl, suffix);
+            SQUID_ASSERT(n > 0 && static_cast<size_t>(n) < sizeof(name_buf));
+            upload_raw(up, sf_main, std::string_view(name_buf, static_cast<size_t>(n)), dst, bytes);
+        };
+
+        for (int vl = 0; vl < VIS_LAYERS; ++vl) {
+            VisionLayerWeights& vlw = vw.layers[vl];
+            vlw.ln_1_w = upload_vis_layer(vl, "ln_1.weight", VIS_HIDDEN);
+            vlw.ln_1_b = upload_vis_layer(vl, "ln_1.bias", VIS_HIDDEN);
+            vlw.ln_2_w = upload_vis_layer(vl, "ln_2.weight", VIS_HIDDEN);
+            vlw.ln_2_b = upload_vis_layer(vl, "ln_2.bias", VIS_HIDDEN);
+            vlw.ls_1_gamma = upload_vis_layer(vl, "ls_1.gamma", VIS_HIDDEN);
+            vlw.ls_2_gamma = upload_vis_layer(vl, "ls_2.gamma", VIS_HIDDEN);
+
+            // Fuse Q, K, V projections into a single contiguous [3072, 1024] weight and [3072] bias.
+            const uint64_t qkv_one_w_bytes = static_cast<uint64_t>(VIS_HIDDEN) * VIS_HIDDEN * 2;
+            vlw.qkv_w = static_cast<__nv_bfloat16*>(arena.alloc_raw(3 * qkv_one_w_bytes));
+            auto* qkv_w_u8 = reinterpret_cast<uint8_t*>(vlw.qkv_w);
+            upload_vis_raw(vl, "self_attn.q_proj.weight", qkv_w_u8 + 0 * qkv_one_w_bytes, qkv_one_w_bytes);
+            upload_vis_raw(vl, "self_attn.k_proj.weight", qkv_w_u8 + 1 * qkv_one_w_bytes, qkv_one_w_bytes);
+            upload_vis_raw(vl, "self_attn.v_proj.weight", qkv_w_u8 + 2 * qkv_one_w_bytes, qkv_one_w_bytes);
+
+            const uint64_t qkv_one_b_bytes = static_cast<uint64_t>(VIS_HIDDEN) * 2;
+            vlw.qkv_b = static_cast<__nv_bfloat16*>(arena.alloc_raw(3 * qkv_one_b_bytes));
+            auto* qkv_b_u8 = reinterpret_cast<uint8_t*>(vlw.qkv_b);
+            upload_vis_raw(vl, "self_attn.q_proj.bias", qkv_b_u8 + 0 * qkv_one_b_bytes, qkv_one_b_bytes);
+            upload_vis_raw(vl, "self_attn.k_proj.bias", qkv_b_u8 + 1 * qkv_one_b_bytes, qkv_one_b_bytes);
+            upload_vis_raw(vl, "self_attn.v_proj.bias", qkv_b_u8 + 2 * qkv_one_b_bytes, qkv_one_b_bytes);
+
+            vlw.out_proj_w = upload_vis_layer(vl, "self_attn.out_proj.weight", static_cast<uint64_t>(VIS_HIDDEN) * VIS_HIDDEN);
+            vlw.out_proj_b = upload_vis_layer(vl, "self_attn.out_proj.bias", VIS_HIDDEN);
+            vlw.c_fc_w = upload_vis_layer(vl, "mlp.c_fc.weight", static_cast<uint64_t>(VIS_INTERMEDIATE) * VIS_HIDDEN);
+            vlw.c_fc_b = upload_vis_layer(vl, "mlp.c_fc.bias", VIS_INTERMEDIATE);
+            vlw.c_proj_w = upload_vis_layer(vl, "mlp.c_proj.weight", static_cast<uint64_t>(VIS_HIDDEN) * VIS_INTERMEDIATE);
+            vlw.c_proj_b = upload_vis_layer(vl, "mlp.c_proj.bias", VIS_HIDDEN);
+        }
+        vw.loaded = true;
+    }
+
     // --- Ablation Weights ---
     if (has_ablation) {
         constexpr size_t kDirElems = static_cast<size_t>(NUM_VISITS) * HIDDEN;
@@ -1070,9 +1151,10 @@ bool LoadedModel::load(
 
     const double elapsed_sec = static_cast<double>(clock_monotonic_ns() - start_ns) / 1e9;
     const double vram_gib = static_cast<double>(arena.capacity_bytes) / (1024.0 * 1024.0 * 1024.0);
-    printf("[weights] Loaded mode=%s in %.2fs | VRAM=%.2f GiB (1 arena, %u tensors) | MTP=%s | Ablation=%s\n",
+    printf("[weights] Loaded mode=%s in %.2fs | VRAM=%.2f GiB (1 arena, %u tensors) | MTP=%s | Vision=%s | Ablation=%s\n",
            quant_mode_name(quant_mode), elapsed_sec, vram_gib, arena.allocation_count,
            mw.dspark.loaded ? "on" : "off",
+           mw.vision.loaded ? "on" : "off",
            !ablation.active ? "off" : (ablation.has_detectors ? "gated-lda" : "plain"));
     std::fflush(stdout);
     return true;

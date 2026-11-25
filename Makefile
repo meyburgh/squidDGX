@@ -6,21 +6,21 @@ BUILD_DIR := build
 TARGET    := $(BUILD_DIR)/squidDGX
 TEST_BIN  := $(BUILD_DIR)/test_unit
 
-CXXFLAGS  := -O3 -std=c++20 -mcpu=native -Icuda -Isrc -I$(CUDA_PATH)/include \
+CXXFLAGS  := -O3 -std=c++20 -mcpu=native -Icuda -Isrc -Ithird_party -I$(CUDA_PATH)/include \
              -Wall -Wextra -Wno-unused-parameter -fno-exceptions -fno-rtti
 NVCCFLAGS := -O3 --use_fast_math -std=c++20 -gencode arch=compute_121a,code=sm_121a \
              --expt-relaxed-constexpr -Icuda
-LDFLAGS   := -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lpthread -lm
+LDFLAGS   := -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lwebp -lcurl -lpthread -lm
 
 CUDA_HDRS := cuda/config.hpp cuda/weights.hpp cuda/kernels.hpp cuda/kernels_common.cuh
 CUDA_SRCS := cuda/kernels_gemv.cu cuda/kernels_inkling.cu cuda/kernels_dspark.cu \
-             cuda/kernels_prefill.cu cuda/kernels_utils.cu
+             cuda/kernels_prefill.cu cuda/kernels_vision.cu cuda/kernels_utils.cu
 CUDA_OBJS := $(patsubst cuda/%.cu,$(BUILD_DIR)/cu_%.o,$(CUDA_SRCS))
 
 CPP_HDRS  := src/tiger.hpp src/vram_arena.hpp src/safetensors.hpp src/weights.hpp \
-             src/tokenizer.hpp src/engine.hpp src/server.hpp
+             src/tokenizer.hpp src/vision.hpp src/engine.hpp src/server.hpp
 CPP_SRCS  := src/safetensors.cpp src/weights.cpp src/tokenizer.cpp \
-             src/engine.cpp src/server.cpp src/main.cpp
+             src/vision.cpp src/engine.cpp src/server.cpp src/main.cpp
 CPP_OBJS  := $(patsubst src/%.cpp,$(BUILD_DIR)/cpp_%.o,$(CPP_SRCS))
 
 .PHONY: all test clean

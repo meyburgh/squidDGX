@@ -6,6 +6,7 @@
 #include "server.hpp"
 #include "tiger.hpp"
 #include "tokenizer.hpp"
+#include "vision.hpp"
 #include "weights.hpp"
 
 #include <fcntl.h>
@@ -28,7 +29,7 @@ void print_usage() {
         "squidDGX — C++20 + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n"
         "Usage:\n"
         "  squidDGX serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv bf16|auto|fp8|q4] [--ctx 262144] [--max-tokens 65536] [--mtp 7] [--spec-threshold 0.75] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n"
-        "  squidDGX generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 65536] [--ctx 262144]\n"
+        "  squidDGX generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--image PATH]... [--mode nvfp4] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 65536] [--ctx 262144]\n"
         "  squidDGX bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode nvfp4] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 262144]\n"
         "  squidDGX longctx  <model_dir> [--mode nvfp4|fp8|exact] [--kv bf16|fp8|q4] [--ctx 262144]\n"
         "  squidDGX logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode nvfp4] [--kv bf16] [--ctx 262144]\n"
@@ -153,6 +154,8 @@ int main(int argc, char** argv) {
     bool raw_thinking = false;
     bool keep_history_thinking = false;
     bool has_tokens_arg = false;
+    std::string_view image_paths[16];
+    size_t image_count = 0;
 
     for (int arg_i = 3; arg_i < argc; ++arg_i) {
         const std::string_view arg(argv[arg_i]);
@@ -161,6 +164,10 @@ int main(int argc, char** argv) {
         else if (arg == "--tokens-file" && has_val()) { tokens_file = argv[++arg_i]; has_tokens_arg = true; }
         else if (arg == "--prompt" && has_val()) { prompt_text = argv[++arg_i]; }
         else if (arg == "--prompt-file" && has_val()) { prompt_file = argv[++arg_i]; }
+        else if (arg == "--image" && has_val()) {
+            if (image_count < 16) image_paths[image_count++] = argv[++arg_i];
+            else ++arg_i;
+        }
         else if (arg == "--mode" && has_val()) { mode_str = argv[++arg_i]; }
         else if (arg == "--kv" && has_val()) { kv_str = argv[++arg_i]; }
         else if (arg == "--host" && has_val()) { host = argv[++arg_i]; }
@@ -240,7 +247,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    const bool need_tokenizer = (command == "serve" || !prompt_text.empty());
+    const bool need_tokenizer = (command == "serve" || !prompt_text.empty() || image_count > 0);
     squid::Tokenizer tokenizer{};
     if (need_tokenizer && !tokenizer.load(model_directory)) {
         squid::free_host(prompt_file_buf);
@@ -266,18 +273,50 @@ int main(int argc, char** argv) {
     int32_t* prompt_ids_buf = squid::alloc_host_zeroed<int32_t>(prompt_ids_cap);
     size_t prompt_len = 0;
 
-    if (!prompt_text.empty() && !has_tokens_arg) {
+    squid::PreprocessedImage cli_images[16]{};
+    size_t cli_image_count = 0;
+    for (size_t ii = 0; ii < image_count; ++ii) {
+        if (!squid::preprocess_image_source(image_paths[ii], cli_images[cli_image_count])) {
+            fprintf(stderr, "Failed to load/decode --image '%.*s'\n",
+                    static_cast<int>(image_paths[ii].size()), image_paths[ii].data());
+            for (size_t jj = 0; jj < cli_image_count; ++jj) cli_images[jj].deinit();
+            squid::free_host(prompt_ids_buf);
+            if (need_tokenizer) tokenizer.deinit();
+            squid::free_host(prompt_file_buf);
+            return 1;
+        }
+        ++cli_image_count;
+    }
+
+    if ((!prompt_text.empty() || cli_image_count > 0) && !has_tokens_arg) {
         squid::TokenizerScratch scratch{};
         scratch.init();
         const size_t render_cap = std::max<size_t>(prompt_text.size() + 4096, 65536);
         char* render_buf = squid::alloc_host_zeroed<char>(render_cap);
-        std::string_view input_slice = prompt_text;
-        if (!raw_prompt) {
+        if (raw_prompt) {
+            prompt_len = tokenizer.encode_into(prompt_text, true, scratch, prompt_ids_buf, prompt_ids_cap);
+        } else {
             squid::ByteWriter rw(render_buf, render_cap);
-            squid::Tokenizer::render_single_user_prompt(rw, prompt_text, effort);
-            input_slice = rw.slice();
+            squid::Tokenizer::emit_thinking_effort(rw, effort);
+            prompt_len += tokenizer.encode_into(rw.slice(), true, scratch, prompt_ids_buf + prompt_len, prompt_ids_cap - prompt_len);
+            for (size_t ii = 0; ii < cli_image_count; ++ii) {
+                prompt_len += tokenizer.encode_into("<|message_user|><|content_image|>", true, scratch,
+                                                    prompt_ids_buf + prompt_len, prompt_ids_cap - prompt_len);
+                const int n_tok = cli_images[ii].num_tokens;
+                for (int it = 0; it < n_tok && prompt_len < prompt_ids_cap; ++it) {
+                    prompt_ids_buf[prompt_len++] = squid::IMAGE_TOKEN_ID;
+                }
+                prompt_len += tokenizer.encode_into("<|end_message|>", true, scratch,
+                                                    prompt_ids_buf + prompt_len, prompt_ids_cap - prompt_len);
+            }
+            if (!prompt_text.empty()) {
+                rw.reset();
+                rw.append_slice("<|message_user|><|content_text|>");
+                rw.append_slice(prompt_text);
+                rw.append_slice("<|end_message|>");
+                prompt_len += tokenizer.encode_into(rw.slice(), true, scratch, prompt_ids_buf + prompt_len, prompt_ids_cap - prompt_len);
+            }
         }
-        prompt_len = tokenizer.encode_into(input_slice, true, scratch, prompt_ids_buf, prompt_ids_cap);
         squid::free_host(render_buf);
         scratch.deinit();
     } else if (!tokens_file.empty()) {
@@ -525,17 +564,33 @@ int main(int argc, char** argv) {
     } else if (command == "generate") {
         const size_t out_cap = std::max<size_t>(std::min(max_tokens, ctx), 64);
         int32_t* out_tokens_buf = squid::alloc_host_zeroed<int32_t>(out_cap);
-        const squid::GenerateStats st = engine.generate(prompt_ids_buf, prompt_len, max_tokens, mtp, out_tokens_buf, out_cap);
-        const double dec_toks = static_cast<double>(st.generated_tokens > 0 ? st.generated_tokens - 1 : 0);
-        const double tps = (st.decode_ms > 0.0) ? (dec_toks * 1000.0 / st.decode_ms) : 0.0;
-        const double acc_pct = (st.total_drafts > 0) ? (100.0 * static_cast<double>(st.total_accepted) / st.total_drafts) : 0.0;
-        const double dl = (st.spec_steps > 0) ? (dec_toks / st.spec_steps) : 1.0;
+        float* d_vis_embeds = nullptr;
+        squid::Engine::VisionInput vis_in{};
+        if (cli_image_count > 0) {
+            size_t total_vis_toks = 0;
+            d_vis_embeds = engine.encode_images(cli_images, cli_image_count, &total_vis_toks);
+            if (!d_vis_embeds) {
+                fprintf(stderr, "Failed to encode vision inputs (checkpoint missing vision weights?)\n");
+                exit_code = 1;
+            } else {
+                vis_in = {d_vis_embeds, total_vis_toks};
+            }
+        }
+        if (exit_code == 0) {
+            const squid::GenerateStats st = engine.generate(
+                prompt_ids_buf, prompt_len, max_tokens, mtp, out_tokens_buf, out_cap, nullptr, nullptr, vis_in);
+            const double dec_toks = static_cast<double>(st.generated_tokens > 0 ? st.generated_tokens - 1 : 0);
+            const double tps = (st.decode_ms > 0.0) ? (dec_toks * 1000.0 / st.decode_ms) : 0.0;
+            const double acc_pct = (st.total_drafts > 0) ? (100.0 * static_cast<double>(st.total_accepted) / st.total_drafts) : 0.0;
+            const double dl = (st.spec_steps > 0) ? (dec_toks / st.spec_steps) : 1.0;
 
-        printf("[gen] prompt=%u gen=%u prefill=%.2fms decode=%.2fms speed=%.2f tok/s | mtp=%u acc=%.1f%% dl=%.2f lookup=%u/%u\n",
-               st.prompt_tokens, st.generated_tokens, st.prefill_ms, st.decode_ms, tps, mtp, acc_pct, dl, st.lookup_steps, st.spec_steps);
-        std::fflush(stdout);
-        print_token_csv("TOKENS:", out_tokens_buf, st.generated_tokens);
-        if (need_tokenizer) print_decoded(tokenizer, out_tokens_buf, st.generated_tokens);
+            printf("[gen] prompt=%u gen=%u prefill=%.2fms decode=%.2fms speed=%.2f tok/s | mtp=%u acc=%.1f%% dl=%.2f lookup=%u/%u\n",
+                   st.prompt_tokens, st.generated_tokens, st.prefill_ms, st.decode_ms, tps, mtp, acc_pct, dl, st.lookup_steps, st.spec_steps);
+            std::fflush(stdout);
+            print_token_csv("TOKENS:", out_tokens_buf, st.generated_tokens);
+            if (need_tokenizer) print_decoded(tokenizer, out_tokens_buf, st.generated_tokens);
+        }
+        if (d_vis_embeds) CUDA_CHECK(cudaFree(d_vis_embeds));
         squid::free_host(out_tokens_buf);
     } else if (command == "bench") {
         const size_t out_cap = std::max<size_t>(std::min(max_tokens, ctx), 64);
@@ -590,6 +645,7 @@ int main(int argc, char** argv) {
         exit_code = 1;
     }
 
+    for (size_t ii = 0; ii < cli_image_count; ++ii) cli_images[ii].deinit();
     engine.deinit();
     model.deinit();
     squid::free_host(prompt_ids_buf);

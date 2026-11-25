@@ -470,6 +470,8 @@ void Engine::deinit() {
         if (prefill_b8_graph_exec[i]) CUDA_CHECK(cudaGraphExecDestroy(prefill_b8_graph_exec[i]));
         prefill_b8_graph_exec[i] = nullptr;
     }
+    if (d_vis_dst) CUDA_CHECK(cudaFree(d_vis_dst));
+    if (d_vis_src) CUDA_CHECK(cudaFree(d_vis_src));
     if (h_decode_result) CUDA_CHECK(cudaFreeHost(h_decode_result));
     if (h_lookup_draft) CUDA_CHECK(cudaFreeHost(h_lookup_draft));
     deinit_prefix_cache();
@@ -705,12 +707,70 @@ void Engine::copy_global_kv_shield(uint32_t token_count, bool save_d2h) {
     CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
+float* Engine::encode_images(const PreprocessedImage* images, size_t n_images, size_t* out_total_tokens) {
+    if (out_total_tokens) *out_total_tokens = 0;
+    if (!model || !model->mw.vision.loaded || !images || n_images == 0) return nullptr;
+
+    size_t total_tokens = 0;
+    size_t max_patch_elems = 0;
+    for (size_t i = 0; i < n_images; ++i) {
+        total_tokens += static_cast<size_t>(images[i].num_tokens);
+        const size_t pe = static_cast<size_t>(images[i].num_patches) * VIS_PATCH_DIM;
+        if (pe > max_patch_elems) max_patch_elems = pe;
+    }
+    if (total_tokens == 0 || max_patch_elems == 0) return nullptr;
+
+    float* d_embeds = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_embeds, total_tokens * HIDDEN * sizeof(float)));
+    __nv_bfloat16* d_patches = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_patches, max_patch_elems * sizeof(__nv_bfloat16)));
+
+    size_t tok_off = 0;
+    for (size_t i = 0; i < n_images; ++i) {
+        const PreprocessedImage& img = images[i];
+        const size_t pbytes = static_cast<size_t>(img.num_patches) * VIS_PATCH_DIM * sizeof(__nv_bfloat16);
+        CUDA_CHECK(cudaMemcpyAsync(d_patches, img.patches, pbytes, cudaMemcpyHostToDevice, stream));
+        launch_vision_encode(model->mw.vision, d_patches, img.grid_rows, img.grid_cols, d_embeds + tok_off * HIDDEN, stream);
+        tok_off += static_cast<size_t>(img.num_tokens);
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(d_patches));
+
+    if (out_total_tokens) *out_total_tokens = total_tokens;
+    return d_embeds;
+}
+
+void Engine::scatter_chunk_vision(const int32_t* host_tokens, int batch_size, float* target_hidden) {
+    if (!active_vision.d_embeds || active_vision.count == 0 || !host_tokens || batch_size <= 0) return;
+    int32_t h_dst[PREFILL_BATCH_MAX];
+    int32_t h_src[PREFILL_BATCH_MAX];
+    int n_slots = 0;
+    for (int b = 0; b < batch_size; ++b) {
+        if (host_tokens[b] == IMAGE_TOKEN_ID) {
+            SQUID_ASSERT(active_vision_cursor < active_vision.count);
+            h_dst[n_slots] = b;
+            h_src[n_slots] = static_cast<int32_t>(active_vision_cursor++);
+            ++n_slots;
+        }
+    }
+    if (n_slots == 0) return;
+    if (!d_vis_dst) {
+        CUDA_CHECK(cudaMalloc(&d_vis_dst, PREFILL_BATCH_MAX * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_vis_src, PREFILL_BATCH_MAX * sizeof(int32_t)));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpy(d_vis_dst, h_dst, static_cast<size_t>(n_slots) * sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_vis_src, h_src, static_cast<size_t>(n_slots) * sizeof(int32_t), cudaMemcpyHostToDevice));
+    launch_scatter_vision_embeds(target_hidden, active_vision.d_embeds, d_vis_dst, d_vis_src, n_slots, stream);
+}
+
 GenerateStats Engine::generate(
     const int32_t* prompt, size_t prompt_len,
     uint32_t max_new_tokens, uint32_t num_drafts,
     int32_t* out_tokens, size_t out_cap,
-    TokenCallbackFn on_token, void* cb_ctx) {
-    return generate_with_hint(prompt, prompt_len, 0, max_new_tokens, num_drafts, out_tokens, out_cap, on_token, cb_ctx);
+    TokenCallbackFn on_token, void* cb_ctx,
+    VisionInput vision) {
+    return generate_with_hint(prompt, prompt_len, 0, max_new_tokens, num_drafts, out_tokens, out_cap, on_token, cb_ctx, vision);
 }
 
 GenerateStats Engine::generate_with_hint(
@@ -718,7 +778,8 @@ GenerateStats Engine::generate_with_hint(
     uint32_t system_prefix_hint,
     uint32_t max_new_tokens_in, uint32_t num_drafts_in,
     int32_t* out_tokens, size_t out_cap,
-    TokenCallbackFn on_token, void* cb_ctx) {
+    TokenCallbackFn on_token, void* cb_ctx,
+    VisionInput vision) {
     SQUID_ASSERT(model != nullptr);
     GenerateStats stats{};
     stats.prompt_tokens = static_cast<uint32_t>(prompt_len_in);
@@ -746,8 +807,10 @@ GenerateStats Engine::generate_with_hint(
     const uint64_t prefill_start_ns = clock_monotonic_ns();
     uint32_t start_pos = 0;
     uint32_t shield_tokens = 0;
+    const bool has_vision_input = (vision.d_embeds != nullptr && vision.count > 0);
+    const bool use_prefix_cache = (prefix_cache.enabled && !has_vision_input);
 
-    if (prefix_cache.enabled) {
+    if (use_prefix_cache) {
         const uint32_t max_match = std::min(prefix_cache.session_len, prompt_len > 1 ? prompt_len - 1 : 0u);
         uint32_t common = 0;
         while (common < max_match && prefix_cache.session_tokens[common] == prompt[common]) ++common;
@@ -789,6 +852,11 @@ GenerateStats Engine::generate_with_hint(
         }
     } else {
         reset();
+        if (prefix_cache.enabled) {
+            prefix_cache.gpu_live_at_pos = -1;
+            prefix_cache.session_len = 0;
+            for (size_t s = 0; s < PREFIX_CHECKPOINT_COUNT; ++s) prefix_cache.checkpoints[s].valid = false;
+        }
     }
 
     struct ShieldGuard {
@@ -802,7 +870,7 @@ GenerateStats Engine::generate_with_hint(
         }
     } shield_guard{this, shield_tokens};
 
-    if (prefix_cache.enabled && shield_tokens == 0) {
+    if (use_prefix_cache && shield_tokens == 0) {
         for (size_t s = 0; s < PREFIX_CHECKPOINT_COUNT; ++s) {
             if (prefix_cache.checkpoints[s].valid && prefix_cache.checkpoints[s].pos > start_pos) {
                 prefix_cache.checkpoints[s].valid = false;
@@ -811,13 +879,13 @@ GenerateStats Engine::generate_with_hint(
     }
 
     const uint32_t rem_tokens = prompt_len - start_pos;
-    if (use_graphs && rem_tokens > static_cast<uint32_t>(MTP_BLOCK_SIZE)) {
+    if (use_graphs && !has_vision_input && rem_tokens > static_cast<uint32_t>(MTP_BLOCK_SIZE)) {
         ensure_prefill_b8_graph(use_mtp);
     }
 
     uint32_t target_sys = 0;
     uint32_t target_2k = 0;
-    if (prefix_cache.enabled && shield_tokens == 0) {
+    if (use_prefix_cache && shield_tokens == 0) {
         if (system_prefix_hint >= 128 && system_prefix_hint > start_pos && system_prefix_hint < prompt_len) {
             target_sys = system_prefix_hint;
         }
@@ -826,6 +894,9 @@ GenerateStats Engine::generate_with_hint(
             target_2k = p2k;
         }
     }
+
+    active_vision = vision;
+    active_vision_cursor = 0;
 
     struct Target { uint32_t pos; size_t slot; };
     Target targets[2] = {
@@ -841,13 +912,18 @@ GenerateStats Engine::generate_with_hint(
     }
 
     const uint32_t last_batch = prefill_final_range(prompt, i, prompt_len, use_mtp);
+    if (has_vision_input) {
+        SQUID_ASSERT(active_vision_cursor == active_vision.count);
+    }
+    active_vision = {};
+    active_vision_cursor = 0;
 
     int32_t first_tok = 0;
     CUDA_CHECK(cudaMemcpyAsync(&first_tok, d_next_tokens + (last_batch - 1), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemcpyAsync(d_pos, &current_position, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    if (prefix_cache.enabled && shield_tokens == 0) {
+    if (use_prefix_cache && shield_tokens == 0) {
         std::memcpy(prefix_cache.session_tokens + start_pos, prompt + start_pos, (prompt_len - start_pos) * sizeof(int32_t));
         prefix_cache.session_len = prompt_len;
         prefix_cache.session_use_mtp = use_mtp;
@@ -895,7 +971,7 @@ GenerateStats Engine::generate_with_hint(
             }
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
-            if (prefix_cache.enabled && shield_tokens == 0 && prefix_cache.session_len < context_tokens_max) {
+            if (use_prefix_cache && shield_tokens == 0 && prefix_cache.session_len < context_tokens_max) {
                 prefix_cache.session_tokens[prefix_cache.session_len++] = prev_fed_tok;
             }
             const int32_t tok = h_decode_result->tokens[0];
@@ -947,7 +1023,7 @@ GenerateStats Engine::generate_with_hint(
             SQUID_ASSERT(n_acc_i32 >= 1 && n_acc_i32 <= chosen_w);
             const uint32_t n_acc = static_cast<uint32_t>(n_acc_i32);
 
-            if (prefix_cache.enabled && shield_tokens == 0) {
+            if (use_prefix_cache && shield_tokens == 0) {
                 for (uint32_t ci = 0; ci < n_acc && prefix_cache.session_len < context_tokens_max; ++ci) {
                     const int32_t fed = (ci == 0) ? prev_fed_tok : h_decode_result->tokens[ci - 1];
                     prefix_cache.session_tokens[prefix_cache.session_len++] = fed;
@@ -998,7 +1074,7 @@ GenerateStats Engine::generate_with_hint(
             SQUID_ASSERT(n_acc_i32 >= 1 && n_acc_i32 <= batch);
             const uint32_t n_acc = static_cast<uint32_t>(n_acc_i32);
 
-            if (prefix_cache.enabled && shield_tokens == 0) {
+            if (use_prefix_cache && shield_tokens == 0) {
                 for (uint32_t ci = 0; ci < n_acc && prefix_cache.session_len < context_tokens_max; ++ci) {
                     const int32_t fed = (ci == 0) ? prev_fed_tok : h_decode_result->tokens[ci - 1];
                     prefix_cache.session_tokens[prefix_cache.session_len++] = fed;
@@ -1032,7 +1108,7 @@ GenerateStats Engine::generate_with_hint(
             launch_inc_pos_and_copy_tok(d_pos, &d_tokens[0], &d_next_tokens[0], &d_decode_result->tokens[0], stream);
             CUDA_CHECK(cudaStreamSynchronize(stream));
 
-            if (prefix_cache.enabled && shield_tokens == 0 && prefix_cache.session_len < context_tokens_max) {
+            if (use_prefix_cache && shield_tokens == 0 && prefix_cache.session_len < context_tokens_max) {
                 prefix_cache.session_tokens[prefix_cache.session_len++] = prev_fed_tok;
             }
             const int32_t tok = h_decode_result->tokens[0];
@@ -1047,7 +1123,7 @@ GenerateStats Engine::generate_with_hint(
     }
 
     stats.decode_ms = static_cast<double>(clock_monotonic_ns() - decode_start_ns) / 1e6;
-    if (prefix_cache.enabled && shield_tokens == 0) {
+    if (use_prefix_cache && shield_tokens == 0) {
         prefix_cache.gpu_live_at_pos = current_position;
         if (prefix_cache.session_len >= 128) save_local_state_checkpoint(3, prefix_cache.session_len);
     }
@@ -1064,7 +1140,7 @@ uint32_t Engine::prefill_range(const int32_t* prompt, uint32_t start_i, uint32_t
         prefill_chunk_batched(prompt, i, chunk, use_mtp);
         i += chunk;
     }
-    if (use_graphs && end_i - i >= static_cast<uint32_t>(MTP_BLOCK_SIZE)) {
+    if (use_graphs && active_vision.count == 0 && end_i - i >= static_cast<uint32_t>(MTP_BLOCK_SIZE)) {
         cudaGraphExec_t pgraph = prefill_b8_graph_exec[use_mtp ? 1 : 0];
         CUDA_CHECK(cudaMemcpyAsync(d_pos, &current_position, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         while (i + MTP_BLOCK_SIZE <= end_i && (!compute_last_lm || i + MTP_BLOCK_SIZE < end_i)) {
@@ -1079,7 +1155,7 @@ uint32_t Engine::prefill_range(const int32_t* prompt, uint32_t start_i, uint32_t
         const bool is_last = compute_last_lm && (i + batch == end_i);
         CUDA_CHECK(cudaMemcpyAsync(d_tokens, prompt + i, batch * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(d_pos, &current_position, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        record_target_forward(static_cast<int32_t>(batch), use_mtp, is_last, false);
+        record_target_forward(static_cast<int32_t>(batch), use_mtp, is_last, false, prompt + i);
         current_position += static_cast<int32_t>(batch);
         i += batch;
     }
@@ -1096,7 +1172,7 @@ uint32_t Engine::prefill_final_range(const int32_t* prompt, uint32_t start_i, ui
         prefill_chunk_batched(prompt, i, chunk, use_mtp);
         i += chunk;
     }
-    if (use_graphs && prompt_len - i > static_cast<uint32_t>(MTP_BLOCK_SIZE)) {
+    if (use_graphs && active_vision.count == 0 && prompt_len - i > static_cast<uint32_t>(MTP_BLOCK_SIZE)) {
         cudaGraphExec_t pgraph = prefill_b8_graph_exec[use_mtp ? 1 : 0];
         CUDA_CHECK(cudaMemcpyAsync(d_pos, &current_position, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         while (i + MTP_BLOCK_SIZE < prompt_len) {
@@ -1112,7 +1188,7 @@ uint32_t Engine::prefill_final_range(const int32_t* prompt, uint32_t start_i, ui
         const bool is_last = (i + batch == prompt_len);
         CUDA_CHECK(cudaMemcpyAsync(d_tokens, prompt + i, batch * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(d_pos, &current_position, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        record_target_forward(static_cast<int32_t>(batch), use_mtp, is_last, false);
+        record_target_forward(static_cast<int32_t>(batch), use_mtp, is_last, false, prompt + i);
         current_position += static_cast<int32_t>(batch);
         i += batch;
         last_batch = batch;
@@ -1136,6 +1212,7 @@ void Engine::prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint
     CUDA_CHECK(cudaMemcpyAsync(p_tokens, prompt + start_i, b_usize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
     launch_embed_norm(mw.embed, mw.embed_norm, p_tokens, p_hidden, b_i32, stream);
+    scatter_chunk_vision(prompt + start_i, b_i32, p_hidden);
 
     int block_count = 0;
     bool has_prior = false;
@@ -1484,13 +1561,16 @@ bool Engine::eval_logits_streaming(
     return true;
 }
 
-void Engine::record_target_forward(int32_t batch_size, bool commit_dspark, bool compute_lm_head, bool is_verify) {
+void Engine::record_target_forward(int32_t batch_size, bool commit_dspark, bool compute_lm_head, bool is_verify, const int32_t* host_tokens) {
     SQUID_ASSERT(batch_size >= 1 && batch_size <= MTP_BLOCK_SIZE);
     const LoadedModel& lm = *model;
     const ModelWeights& mw = lm.mw;
     const size_t b_usize = static_cast<size_t>(batch_size);
 
     launch_embed_norm(mw.embed, mw.embed_norm, d_tokens, hidden, batch_size, stream);
+    if (host_tokens != nullptr && active_vision.count > 0) {
+        scatter_chunk_vision(host_tokens, batch_size, hidden);
+    }
 
     int block_count = 0;
     bool has_prior = false;

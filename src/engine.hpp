@@ -4,6 +4,7 @@
 
 #include "config.hpp"
 #include "kernels.hpp"
+#include "vision.hpp"
 #include "vram_arena.hpp"
 #include "weights.hpp"
 #include <cuda_fp16.h>
@@ -34,6 +35,11 @@ struct GenerateStats {
     uint32_t total_drafts = 0;
     uint32_t total_accepted = 0;
     int32_t last_token_id = -1;
+};
+
+struct VisionInput {
+    const float* d_embeds = nullptr;
+    size_t count = 0;
 };
 
 struct PromptLookupIndex {
@@ -289,23 +295,35 @@ struct Engine {
     float* p_ctrl_f = nullptr;
     float* p_ctrl_g = nullptr;
 
+    using VisionInput = squid::VisionInput;
+    VisionInput active_vision{};
+    size_t active_vision_cursor = 0;
+    int32_t* d_vis_dst = nullptr;
+    int32_t* d_vis_src = nullptr;
+
     bool init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFormat kv_fmt);
     void deinit();
     void reset();
     void enable_prefix_cache();
 
+    // Encode preprocessed images into a newly cudaMalloc'd GPU FP32 buffer [total_tokens, HIDDEN].
+    // Caller must free with cudaFree(). Returns nullptr if vision weights are unavailable or empty.
+    float* encode_images(const PreprocessedImage* images, size_t n_images, size_t* out_total_tokens);
+
     GenerateStats generate(
         const int32_t* prompt, size_t prompt_len,
         uint32_t max_new_tokens, uint32_t num_drafts,
         int32_t* out_tokens, size_t out_cap,
-        TokenCallbackFn on_token = nullptr, void* cb_ctx = nullptr);
+        TokenCallbackFn on_token = nullptr, void* cb_ctx = nullptr,
+        VisionInput vision = {});
 
     GenerateStats generate_with_hint(
         const int32_t* prompt, size_t prompt_len,
         uint32_t system_prefix_hint,
         uint32_t max_new_tokens, uint32_t num_drafts,
         int32_t* out_tokens, size_t out_cap,
-        TokenCallbackFn on_token = nullptr, void* cb_ctx = nullptr);
+        TokenCallbackFn on_token = nullptr, void* cb_ctx = nullptr,
+        VisionInput vision = {});
 
     double bench_step_at_pos(int32_t sim_pos, uint32_t num_drafts, uint32_t iterations);
 
@@ -321,13 +339,14 @@ private:
     void save_local_state_checkpoint(size_t slot_idx, uint32_t pos);
     void restore_local_state_checkpoint(size_t slot_idx);
     void copy_global_kv_shield(uint32_t token_count, bool save_d2h);
+    void scatter_chunk_vision(const int32_t* host_tokens, int batch_size, float* target_hidden);
 
     void alloc_kv_pair(uint32_t cap_tokens, KVFormat fmt, void** k_out, void** v_out, __half** ks_out, __half** vs_out);
 
     uint32_t prefill_range(const int32_t* prompt, uint32_t start_i, uint32_t end_i, bool use_mtp, bool compute_last_lm);
     uint32_t prefill_final_range(const int32_t* prompt, uint32_t start_i, uint32_t prompt_len, bool use_mtp);
     void prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint32_t chunk_len, bool commit_dspark);
-    void record_target_forward(int32_t batch_size, bool commit_dspark, bool compute_lm_head, bool is_verify);
+    void record_target_forward(int32_t batch_size, bool commit_dspark, bool compute_lm_head, bool is_verify, const int32_t* host_tokens = nullptr);
 
     void ensure_b1_graph();
     void ensure_prefill_b8_graph(bool commit_dspark);

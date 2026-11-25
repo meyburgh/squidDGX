@@ -128,6 +128,36 @@ struct DsparkWeights {
     DsparkLayerWeights layers[MTP_LAYERS];
 };
 
+struct VisionLayerWeights {
+    __nv_bfloat16* ln_1_w = nullptr;      // [1024]
+    __nv_bfloat16* ln_1_b = nullptr;      // [1024]
+    __nv_bfloat16* ln_2_w = nullptr;      // [1024]
+    __nv_bfloat16* ln_2_b = nullptr;      // [1024]
+    __nv_bfloat16* ls_1_gamma = nullptr;  // [1024]
+    __nv_bfloat16* ls_2_gamma = nullptr;  // [1024]
+    __nv_bfloat16* qkv_w = nullptr;       // fused [3072, 1024] (q, k, v)
+    __nv_bfloat16* qkv_b = nullptr;       // fused [3072]
+    __nv_bfloat16* out_proj_w = nullptr;  // [1024, 1024]
+    __nv_bfloat16* out_proj_b = nullptr;  // [1024]
+    __nv_bfloat16* c_fc_w = nullptr;      // [4096, 1024]
+    __nv_bfloat16* c_fc_b = nullptr;      // [4096]
+    __nv_bfloat16* c_proj_w = nullptr;    // [1024, 4096]
+    __nv_bfloat16* c_proj_b = nullptr;    // [1024]
+};
+
+struct VisionWeights {
+    bool loaded = false;
+    __nv_bfloat16* class_embedding = nullptr;        // [1024]
+    __nv_bfloat16* cls_position_embedding = nullptr; // [1024]
+    __nv_bfloat16* patch_embedding = nullptr;        // [1024, 1200]
+    __nv_bfloat16* position_embedding = nullptr;     // [1024, 1024] (32x32 grid)
+    __nv_bfloat16* ln_pre_w = nullptr;               // [1024]
+    __nv_bfloat16* ln_pre_b = nullptr;               // [1024]
+    __nv_bfloat16* proj_in = nullptr;                // [4096, 4096]
+    __nv_bfloat16* proj_out = nullptr;               // [2304, 4096]
+    VisionLayerWeights layers[VIS_LAYERS];
+};
+
 struct ModelWeights {
     QuantMode mode = QuantMode::Exact;
 
@@ -148,6 +178,7 @@ struct ModelWeights {
 
     LayerWeights layers[NUM_LAYERS];
     DsparkWeights dspark;
+    VisionWeights vision;
 };
 
 } // namespace squid

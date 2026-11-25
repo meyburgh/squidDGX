@@ -45,10 +45,22 @@ docker run --rm --gpus all --memory=96000000000 --memory-swap=96000000000 \
 
 ## Benchmarks
 
-Measured on NVIDIA DGX Spark (GB10, `sm_121a`) at `--ctx 262144 --kv bf16`:
+Measured on NVIDIA DGX Spark (GB10, `sm_121a`) at `--ctx 262144 --kv bf16`
+(model load ~2.1–2.4 s).
 
-- **Default (`--mode nvfp4`)**: **24.19 GiB** total VRAM (`MTP=on`: 14.55 GiB weights + 9.64 GiB runtime; model load **2.3 s**).
-- **Exact (`--mode exact`)**: **27.92 GiB** total VRAM (`MTP=on`: 18.28 GiB weights + 9.64 GiB runtime; model load **2.2 s**).
+### Peak memory
+
+Measured during full 7,797-token prefill + decode (`mtp=7`) and single-token
+decode (`mtp=0`) inside a 96 GB Docker container. On GB10 unified memory, host
+`MemAvailable` drop reflects total physical DRAM used by CUDA arenas, driver
+overhead, and host buffers combined.
+
+| Mode (`kv=bf16`, `ctx=262144`) | Speculative | Weights VRAM | Runtime VRAM | Total CUDA VRAM | Cgroup `memory.peak` | Peak Host `MemAvailable` Drop |
+|---|---|---:|---:|---:|---:|---:|
+| **`nvfp4` (default)** | `mtp=7` | 14.55 GiB | 9.64 GiB | **24.19 GiB** | 0.80 GiB | **25.36 GiB** |
+| **`nvfp4` (default)** | `mtp=0` | 14.28 GiB | 8.55 GiB | **22.83 GiB** | 0.43 GiB | **23.68 GiB** |
+| `exact` | `mtp=7` | 18.28 GiB | 9.64 GiB | **27.92 GiB** | 0.81 GiB | **28.97 GiB** |
+| `exact` | `mtp=0` | 17.59 GiB | 8.55 GiB | **26.14 GiB** | 0.44 GiB | **26.85 GiB** |
 
 ### Prefill
 

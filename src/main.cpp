@@ -27,12 +27,12 @@ void print_usage() {
     static constexpr std::string_view kUsage =
         "squidDGX — C++20 + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n"
         "Usage:\n"
-        "  squidDGX serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode exact|fp8|nvfp4] [--kv bf16|auto|fp8|q4] [--ctx 262144] [--max-tokens 65536] [--mtp 7] [--spec-threshold 0.75] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n"
-        "  squidDGX generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 65536] [--ctx 262144]\n"
-        "  squidDGX bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 262144]\n"
-        "  squidDGX longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv bf16|fp8|q4] [--ctx 262144]\n"
-        "  squidDGX logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--ctx 262144]\n"
-        "  squidDGX kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv bf16|auto|fp8|q4] [--ctx 262144]\n"
+        "  squidDGX serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv bf16|auto|fp8|q4] [--ctx 262144] [--max-tokens 65536] [--mtp 7] [--spec-threshold 0.75] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n"
+        "  squidDGX generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 65536] [--ctx 262144]\n"
+        "  squidDGX bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode nvfp4] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 262144]\n"
+        "  squidDGX longctx  <model_dir> [--mode nvfp4|fp8|exact] [--kv bf16|fp8|q4] [--ctx 262144]\n"
+        "  squidDGX logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode nvfp4] [--kv bf16] [--ctx 262144]\n"
+        "  squidDGX kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode nvfp4|fp8|exact] [--kv bf16|auto|fp8|q4] [--ctx 262144]\n"
         "  squidDGX tokenize <model_dir> (--prompt TEXT | --prompt-file PATH) [--raw]\n";
     squid::write_fd_all(2, kUsage);
 }
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
     std::string_view tokens_file;
     std::string_view prompt_text;
     std::string_view prompt_file;
-    std::string_view mode_str = "exact";
+    std::string_view mode_str = "nvfp4";
     std::string_view kv_str = "bf16";
     std::string_view host = "0.0.0.0";
     std::string_view model_name = "inkling-2-mini";

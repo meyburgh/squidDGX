@@ -109,6 +109,17 @@ static void test_json_constraint() {
     SQUID_ASSERT(m.advance("me\":\""));
     SQUID_ASSERT(!s.compile("{not json", &err));
 
+    squid::JsonSchema lim;
+    SQUID_ASSERT(lim.compile(R"({"type":"object","properties":{"h":{"type":"string","maxLength":12,"minLength":2},
+      "xs":{"type":"array","items":{"type":"integer"},"minItems":1,"maxItems":2}}})", &err));
+    SQUID_ASSERT(json_doc(lim, R"({"h":"abcdefghijkl"})", &end) && end);       // 12 chars
+    SQUID_ASSERT(!json_doc(lim, R"({"h":"abcdefghijklm")", &end));             // 13th char refused
+    SQUID_ASSERT(json_doc(lim, "{\"h\":\"\xC3\xA9\xC3\xA9\\n\"}", &end) && end); // 2 code points + escape = 3
+    SQUID_ASSERT(!json_doc(lim, R"({"h":"a"})", &end));                        // below minLength
+    SQUID_ASSERT(json_doc(lim, R"({"xs":[1,2]})", &end) && end);
+    SQUID_ASSERT(!json_doc(lim, R"({"xs":[1,2,)", &end));                      // maxItems
+    SQUID_ASSERT(!json_doc(lim, R"({"xs":[]})", &end));                        // minItems
+
     // Tool calls: {"name": <tool>, "args": <its parameters>}.
     squid::JsonSchema ts;
     ts.init_empty();

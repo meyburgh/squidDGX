@@ -11,7 +11,8 @@
 // Supported keywords: type (string or array), properties, required, additionalProperties
 // (bool or schema), items, enum, const (scalars), anyOf, oneOf (treated as anyOf),
 // allOf with one entry, $ref to "#", "#/$defs/<name>" or "#/definitions/<name>".
-// Ignored (not enforced): string formats/patterns/lengths, numeric ranges, minItems/maxItems.
+// Also minLength/maxLength (counted in code points) and minItems/maxItems.
+// Ignored (not enforced): string formats/patterns and numeric ranges.
 
 #include <cstdint>
 #include <string>
@@ -38,6 +39,10 @@ struct JsonSchemaNode {
     int32_t items = kJsAnyNode;
     std::vector<int32_t> alts;            // anyOf / oneOf members; non-empty => union node
     std::vector<std::string> literals;    // enum / const, serialized; non-empty => must match one
+    uint32_t min_len = 0;                 // strings: minLength / maxLength (code points)
+    uint32_t max_len = UINT32_MAX;
+    uint32_t min_items = 0;               // arrays: minItems / maxItems
+    uint32_t max_items = UINT32_MAX;
     int32_t ref = -1;                     // alias to another node
     std::string ref_path;                 // unresolved $ref
 };

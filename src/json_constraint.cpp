@@ -1,6 +1,7 @@
 #include "json_constraint.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <utility>
@@ -313,7 +314,23 @@ struct Compiler {
             if (serialize_scalar(*c, &ser)) { literals.clear(); literals.push_back(std::move(ser)); }
         }
 
+        auto read_u32 = [&](const char* key, uint32_t* out) {
+            const JVal* x = v.get(key);
+            if (!x || x->t != JVal::Num || x->s.empty() || x->s[0] == '-') return;
+            const unsigned long long u = std::strtoull(x->s.c_str(), nullptr, 10);
+            *out = static_cast<uint32_t>(std::min<unsigned long long>(u, UINT32_MAX));
+        };
+        uint32_t min_len = 0, max_len = UINT32_MAX, min_items = 0, max_items = UINT32_MAX;
+        read_u32("minLength", &min_len);
+        read_u32("maxLength", &max_len);
+        read_u32("minItems", &min_items);
+        read_u32("maxItems", &max_items);
+
         JsonSchemaNode& n = sch.nodes[static_cast<size_t>(idx)];
+        n.min_len = min_len;
+        n.max_len = max_len;
+        n.min_items = min_items;
+        n.max_items = max_items;
         n.types = types;
         n.prop_keys = std::move(keys);
         n.prop_hash = std::move(hashes);
@@ -612,8 +629,8 @@ void JsonMatcher::feed(const Stack& in, uint8_t c, Stack* out, int& n_out, int g
                 continue;
             }
             if (c == '{' && (n.types & kJsObj)) { f.kind = kObj; f.st = kObjStart; f.seen = 0; f.b = -1; emit(true); return; }
-            if (c == '[' && (n.types & kJsArr)) { f.kind = kArr; f.st = kArrStart; emit(true); return; }
-            if (c == '"' && (n.types & kJsStr)) { f.kind = kStr; f.st = 0; f.aux = 0; f.h = kFnvInit; emit(true); return; }
+            if (c == '[' && (n.types & kJsArr)) { f.kind = kArr; f.st = kArrStart; f.a = 0; emit(true); return; }
+            if (c == '"' && (n.types & kJsStr)) { f.kind = kStr; f.st = 0; f.aux = 0; f.a = 0; f.h = kFnvInit; emit(true); return; }
             if ((c == '-' || is_digit(c)) && (n.types & (kJsInt | kJsNum))) {
                 f.kind = kNum; f.st = 0; f.a = 0; f.aux = (n.types & kJsNum) ? 0 : 1;
                 continue;
@@ -690,18 +707,30 @@ void JsonMatcher::feed(const Stack& in, uint8_t c, Stack* out, int& n_out, int g
             const JsonSchemaNode& n = sch.nodes[static_cast<size_t>(f.node)];
             if (f.st == kArrStart) {
                 if (is_ws(c)) { ws_step(); return; }
-                if (c == ']') { pop_value(); emit(true); return; }
+                if (c == ']') {
+                    if (n.min_items > 0) return;
+                    pop_value(); emit(true); return;
+                }
+                if (n.max_items == 0) return;
                 f.st = kArrAfterValue;
+                f.a = 1;
                 if (!push(kValue, n.items)) return;
                 continue;
             }
             if (f.st == kArrAfterValue) {
                 if (is_ws(c)) { ws_step(); return; }
-                if (c == ',') { f.st = kArrNeedValue; emit(true); return; }
-                if (c == ']') { pop_value(); emit(true); return; }
+                if (c == ',') {
+                    if (f.a >= n.max_items) return;
+                    f.st = kArrNeedValue; emit(true); return;
+                }
+                if (c == ']') {
+                    if (f.a < n.min_items) return;
+                    pop_value(); emit(true); return;
+                }
                 return;
             }
             f.st = kArrAfterValue;
+            f.a++;
             if (!push(kValue, n.items)) return;
             continue;
         }
@@ -716,12 +745,18 @@ void JsonMatcher::feed(const Stack& in, uint8_t c, Stack* out, int& n_out, int g
                         }
                         if (!key_done(idx)) return;
                     } else {
+                        if (f.a < sch.nodes[static_cast<size_t>(f.node)].min_len) return;
                         pop_value();
                     }
                     emit(true);
                     return;
                 }
                 if (c < 0x20) return;
+                // Count code points: a lead byte or an escape's backslash starts one.
+                if (f.aux == 0 && (c == '\\' || (c & 0xC0) != 0x80)) {
+                    if (f.a >= sch.nodes[static_cast<size_t>(f.node)].max_len) return;
+                    f.a++;
+                }
                 f.h = fnv(f.h, c);
                 if (c == '\\') f.st = 1;
                 emit(true);

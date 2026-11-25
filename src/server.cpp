@@ -2792,7 +2792,7 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
     g_stop_requested.store(false, std::memory_order_release);
     g_listen_fd.store(listen_fd, std::memory_order_release);
     g_semif_fd.store(semif_fd, std::memory_order_release);
-    engine.enable_prefix_cache();
+    engine.enable_prefix_cache(config.prefix_sessions);
 
     ServerBuffers buffers{};
     buffers.init();

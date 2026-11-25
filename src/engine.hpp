@@ -153,8 +153,27 @@ struct LocalStateCheckpoint {
     uint8_t* data = nullptr;
 };
 
+// A conversation's prefix state parked in host RAM while another conversation uses the GPU:
+// its tokens, the global-layer KV for those tokens, and its local-state checkpoints.
+struct ParkedSession {
+    bool valid = false;
+    bool use_mtp = false;
+    uint64_t last_used = 0;
+    uint32_t len = 0;
+    int32_t* tokens = nullptr;
+    uint32_t tokens_cap = 0;
+    uint8_t* global_kv = nullptr;
+    size_t global_kv_cap = 0;
+    LocalStateCheckpoint checkpoints[PREFIX_CHECKPOINT_COUNT]{};
+};
+constexpr uint32_t PARKED_SESSIONS_MAX = 8;
+constexpr uint32_t PARK_MIN_TOKENS = 1024;   // shorter conversations are cheap to re-prefill
+
 struct PrefixCache {
     bool enabled = false;
+    uint32_t parked_count = 0;
+    uint64_t use_clock = 0;
+    ParkedSession parked[PARKED_SESSIONS_MAX]{};
     size_t local_state_bytes = 0;
     int32_t* session_tokens = nullptr;
     uint32_t session_len = 0;
@@ -317,7 +336,7 @@ struct Engine {
     bool init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFormat kv_fmt);
     void deinit();
     void reset();
-    void enable_prefix_cache();
+    void enable_prefix_cache(uint32_t parked_sessions = 3);
 
     // Encode preprocessed images into a newly cudaMalloc'd GPU FP32 buffer [total_tokens, HIDDEN].
     // Caller must free with cudaFree(). Returns nullptr if vision weights are unavailable or empty.
@@ -354,6 +373,10 @@ private:
     void save_local_state_checkpoint(size_t slot_idx, uint32_t pos);
     void restore_local_state_checkpoint(size_t slot_idx);
     void copy_global_kv_shield(uint32_t token_count, bool save_d2h);
+    void copy_global_kv(uint8_t* buf, size_t buf_cap, uint32_t token_count, bool save_d2h);
+    void park_live_session(int32_t exclude_slot);
+    void restore_parked_session(uint32_t slot);
+    void select_session_for_prompt(const int32_t* prompt, uint32_t prompt_len, uint32_t max_new_tokens, bool use_mtp, bool prefix_cache_usable);
     void scatter_chunk_vision(const int32_t* host_tokens, int batch_size, float* target_hidden);
 
     void alloc_kv_pair(uint32_t cap_tokens, KVFormat fmt, void** k_out, void** v_out, __half** ks_out, __half** vs_out);

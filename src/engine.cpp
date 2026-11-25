@@ -532,9 +532,10 @@ void Engine::alloc_kv_pair(uint32_t cap_tokens, KVFormat fmt, void** k_out, void
     }
 }
 
-void Engine::enable_prefix_cache() {
+void Engine::enable_prefix_cache(uint32_t parked_sessions) {
     SQUID_ASSERT(model != nullptr);
     if (prefix_cache.enabled) return;
+    prefix_cache.parked_count = std::min(parked_sessions, PARKED_SESSIONS_MAX);
 
     const size_t local_bytes = compute_local_state_bytes();
     const size_t shield_bytes = compute_global_kv_prefix_bytes(SIDE_SHIELD_MAX_TOKENS);
@@ -555,10 +556,28 @@ void Engine::enable_prefix_cache() {
 
     const double host_mib = static_cast<double>(
         local_bytes * PREFIX_CHECKPOINT_COUNT + shield_bytes + static_cast<size_t>(context_tokens_max) * 4) / (1024.0 * 1024.0);
-    printf("[cache] Prefix KV cache enabled (%zu checkpoints + %u-tok side-request shield, host RAM=%.1f MiB, extra VRAM=0.0 MiB)\n",
-           PREFIX_CHECKPOINT_COUNT, SIDE_SHIELD_MAX_TOKENS, host_mib);
+    printf("[cache] Prefix KV cache enabled (%zu checkpoints + %u-tok side-request shield, host RAM=%.1f MiB, extra VRAM=0.0 MiB; "
+           "%u parked conversations, ~%.1f MiB host RAM per 1K tokens each, allocated on demand)\n",
+           PREFIX_CHECKPOINT_COUNT, SIDE_SHIELD_MAX_TOKENS, host_mib, prefix_cache.parked_count,
+           static_cast<double>(compute_global_kv_prefix_bytes(1024)) / (1024.0 * 1024.0));
     std::fflush(stdout);
 }
+
+namespace {
+// Parked-conversation buffers are pinned: the first copy into fresh pageable memory page-faults
+// through gigabytes (seconds); pinned memory copies at full bandwidth from the first use.
+uint8_t* alloc_pinned_bytes(size_t n) {
+    void* p = nullptr;
+    if (cudaMallocHost(&p, n) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return nullptr;
+    }
+    return static_cast<uint8_t*>(p);
+}
+void free_pinned(void* p) {
+    if (p) CUDA_CHECK(cudaFreeHost(p));
+}
+} // namespace
 
 void Engine::deinit_prefix_cache() {
     if (!prefix_cache.enabled) return;
@@ -567,6 +586,12 @@ void Engine::deinit_prefix_cache() {
         free_host(prefix_cache.checkpoints[i].data);
     }
     free_host(prefix_cache.side_shield_buf);
+    for (uint32_t i = 0; i < PARKED_SESSIONS_MAX; ++i) {
+        ParkedSession& ps = prefix_cache.parked[i];
+        if (ps.tokens) free_host(ps.tokens);
+        free_pinned(ps.global_kv);
+        for (size_t c = 0; c < PREFIX_CHECKPOINT_COUNT; ++c) free_pinned(ps.checkpoints[c].data);
+    }
     prefix_cache = PrefixCache{};
 }
 
@@ -674,7 +699,11 @@ void Engine::restore_local_state_checkpoint(size_t slot_idx) {
 
 void Engine::copy_global_kv_shield(uint32_t token_count, bool save_d2h) {
     SQUID_ASSERT(prefix_cache.enabled && token_count > 0 && token_count <= SIDE_SHIELD_MAX_TOKENS);
-    uint8_t* buf = prefix_cache.side_shield_buf;
+    copy_global_kv(prefix_cache.side_shield_buf, prefix_cache.side_shield_bytes, token_count, save_d2h);
+}
+
+void Engine::copy_global_kv(uint8_t* buf, size_t buf_cap, uint32_t token_count, bool save_d2h) {
+    SQUID_ASSERT(token_count > 0);
     const GlobalKVBytes sz = global_kv_bytes_for_tokens(kv_format, token_count);
     size_t off = 0;
 
@@ -703,8 +732,127 @@ void Engine::copy_global_kv_shield(uint32_t token_count, bool save_d2h) {
             xfer(ds_v_scale[1], dsz.scale);
         }
     }
-    SQUID_ASSERT(off <= prefix_cache.side_shield_bytes);
+    SQUID_ASSERT(off <= buf_cap);
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+namespace {
+uint32_t common_prefix_len(const int32_t* a, uint32_t a_len, const int32_t* b, uint32_t b_len) {
+    const uint32_t n = std::min(a_len, b_len);
+    uint32_t i = 0;
+    while (i < n && a[i] == b[i]) ++i;
+    return i;
+}
+} // namespace
+
+// Copies the live conversation (tokens, global KV, valid checkpoints) into a parked slot:
+// a free one, else the least recently used one other than `exclude_slot`.
+void Engine::park_live_session(int32_t exclude_slot) {
+    PrefixCache& pc = prefix_cache;
+    if (pc.parked_count == 0 || pc.session_len < PARK_MIN_TOKENS) return;
+    int32_t slot = -1;
+    for (uint32_t i = 0; i < pc.parked_count; ++i) {
+        if (static_cast<int32_t>(i) == exclude_slot) continue;
+        if (!pc.parked[i].valid) { slot = static_cast<int32_t>(i); break; }
+        if (slot < 0 || pc.parked[i].last_used < pc.parked[slot].last_used) slot = static_cast<int32_t>(i);
+    }
+    if (slot < 0) return;
+    ParkedSession& ps = pc.parked[slot];
+    const uint32_t len = pc.session_len;
+    const size_t kv_bytes = compute_global_kv_prefix_bytes(len);
+    if (ps.tokens_cap < len) {
+        if (ps.tokens) free_host(ps.tokens);
+        ps.tokens_cap = std::min(context_tokens_max, len + len / 4 + 1024);
+        ps.tokens = alloc_host_zeroed<int32_t>(ps.tokens_cap);
+    }
+    if (ps.global_kv_cap < kv_bytes) {
+        free_pinned(ps.global_kv);
+        ps.global_kv_cap = compute_global_kv_prefix_bytes(std::min(context_tokens_max, len + len / 4 + 1024));
+        ps.global_kv = alloc_pinned_bytes(ps.global_kv_cap);
+        if (!ps.global_kv) {  // out of pinned memory: give up on this slot
+            ps.global_kv_cap = 0;
+            ps.valid = false;
+            fprintf(stderr, "[cache] could not pin %.1f MiB to park a conversation\n", static_cast<double>(kv_bytes) / 1048576.0);
+            return;
+        }
+    }
+    const uint64_t t0 = clock_monotonic_ns();
+    std::memcpy(ps.tokens, pc.session_tokens, static_cast<size_t>(len) * sizeof(int32_t));
+    copy_global_kv(ps.global_kv, ps.global_kv_cap, len, true);
+    for (size_t c = 0; c < PREFIX_CHECKPOINT_COUNT; ++c) {
+        const LocalStateCheckpoint& src = pc.checkpoints[c];
+        LocalStateCheckpoint& dst = ps.checkpoints[c];
+        dst.valid = src.valid && src.pos <= len;
+        dst.pos = src.pos;
+        if (!dst.valid) continue;
+        if (!dst.data) dst.data = alloc_pinned_bytes(pc.local_state_bytes);
+        if (!dst.data) { dst.valid = false; continue; }
+        std::memcpy(dst.data, src.data, pc.local_state_bytes);
+    }
+    ps.len = len;
+    ps.use_mtp = pc.session_use_mtp;
+    ps.valid = true;
+    ps.last_used = ++pc.use_clock;
+    printf("[cache] parked conversation (%u tokens) in slot %d in %.1f ms\n", len, slot,
+           static_cast<double>(clock_monotonic_ns() - t0) / 1e6);
+}
+
+// Makes a parked conversation the live one. The GPU's local state is not valid for it, so the
+// prefill restores the best checkpoint at or below the common prefix.
+void Engine::restore_parked_session(uint32_t slot) {
+    PrefixCache& pc = prefix_cache;
+    ParkedSession& ps = pc.parked[slot];
+    SQUID_ASSERT(ps.valid && ps.len > 0);
+    const uint64_t t0 = clock_monotonic_ns();
+    std::memcpy(pc.session_tokens, ps.tokens, static_cast<size_t>(ps.len) * sizeof(int32_t));
+    copy_global_kv(ps.global_kv, ps.global_kv_cap, ps.len, false);
+    for (size_t c = 0; c < PREFIX_CHECKPOINT_COUNT; ++c) {
+        LocalStateCheckpoint& dst = pc.checkpoints[c];
+        const LocalStateCheckpoint& src = ps.checkpoints[c];
+        dst.valid = src.valid;
+        dst.pos = src.pos;
+        if (src.valid) std::memcpy(dst.data, src.data, pc.local_state_bytes);
+    }
+    pc.session_len = ps.len;
+    pc.session_use_mtp = ps.use_mtp;
+    pc.gpu_live_at_pos = -1;
+    ps.valid = false;
+    printf("[cache] restored parked conversation (%u tokens) from slot %u in %.1f ms\n", ps.len, slot,
+           static_cast<double>(clock_monotonic_ns() - t0) / 1e6);
+}
+
+// Before a request: if it continues a parked conversation better than the live one, swap that
+// conversation in; if it starts a different conversation that would wipe the live one, park the
+// live one first. Short side requests (handled by the shield) leave everything as it is.
+void Engine::select_session_for_prompt(const int32_t* prompt, uint32_t prompt_len, uint32_t max_new_tokens, bool use_mtp, bool prefix_cache_usable) {
+    PrefixCache& pc = prefix_cache;
+    if (!pc.enabled || pc.parked_count == 0) return;
+    const uint32_t limit = prompt_len > 1 ? prompt_len - 1 : 0;
+    const uint32_t live_common = (pc.session_len > 0)
+        ? common_prefix_len(pc.session_tokens, pc.session_len, prompt, limit) : 0;
+
+    if (!prefix_cache_usable) {
+        // e.g. an image request: it resets the engine, so keep the live conversation.
+        park_live_session(-1);
+        return;
+    }
+    int32_t best = -1;
+    uint32_t best_common = 0;
+    for (uint32_t i = 0; i < pc.parked_count; ++i) {
+        const ParkedSession& ps = pc.parked[i];
+        if (!ps.valid || (use_mtp && !ps.use_mtp)) continue;
+        const uint32_t c = common_prefix_len(ps.tokens, ps.len, prompt, limit);
+        if (c > best_common) { best_common = c; best = static_cast<int32_t>(i); }
+    }
+    if (best >= 0 && best_common >= PARK_MIN_TOKENS && best_common > live_common + 256) {
+        park_live_session(best);
+        restore_parked_session(static_cast<uint32_t>(best));
+        pc.parked[best].last_used = ++pc.use_clock;
+        return;
+    }
+    const uint32_t side_need = prompt_len + max_new_tokens + 16;
+    const bool shielded = (pc.session_len >= 1024 && live_common < 512 && side_need <= SIDE_SHIELD_MAX_TOKENS);
+    if (!shielded && live_common < 512) park_live_session(-1);
 }
 
 float* Engine::encode_images(const PreprocessedImage* images, size_t n_images, size_t* out_total_tokens) {
@@ -827,6 +975,7 @@ GenerateStats Engine::generate_with_hint(
     uint32_t shield_tokens = 0;
     const bool has_vision_input = (vision.d_embeds != nullptr && vision.count > 0);
     const bool use_prefix_cache = (prefix_cache.enabled && !has_vision_input);
+    if (prefix_cache.enabled) select_session_for_prompt(prompt, prompt_len, max_new_tokens, use_mtp, use_prefix_cache);
 
     if (use_prefix_cache) {
         const uint32_t max_match = std::min(prefix_cache.session_len, prompt_len > 1 ? prompt_len - 1 : 0u);
@@ -838,7 +987,9 @@ GenerateStats Engine::generate_with_hint(
             shield_tokens = std::min(prefix_cache.session_len, side_need);
             copy_global_kv_shield(shield_tokens, true);
             reset();
-        } else if (common > 0 && use_mtp == prefix_cache.session_use_mtp) {
+        } else if (common > 0 && (!use_mtp || prefix_cache.session_use_mtp)) {
+            // A session built with MTP also serves a request without it (the draft state just
+            // goes stale); the reverse would leave the draft model without its history.
             const uint32_t reusable_limit = common;
             bool matched_live = false;
             if (prefix_cache.gpu_live_at_pos > 0 &&

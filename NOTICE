@@ -1,4 +1,4 @@
-squid5090
+squidDGX
 Copyright (c) 2026 tensorfish
 
 This project includes kernel designs and inference features adapted from the
@@ -22,7 +22,7 @@ following open-source projects:
    - Offline Fisher-LDA abliteration generation and refusal evaluation tools
      (tools/ablate.py, tools/inkling_ref.py, tools/refusal_eval.py,
      tools/pyproject.toml), adapted to run via `uv` and evaluate refusals via
-     `squid5090 serve`.
+     `squidDGX serve`.
 
 2. AtomicBot-ai/atomic-engine (MIT License, llama.cpp fork)
    https://github.com/AtomicBot-ai/atomic-engine/tree/codex/expert-weight-source
@@ -33,7 +33,7 @@ following open-source projects:
 3. sybil-solutions/inference-optimisation-skill
    https://github.com/sybil-solutions/inference-optimisation-skill
    - Hardware-ceiling roofline methodology, noise-controlled hill-climbing
-     workflow, and lever prioritization documented in LEARNINGS.md.
+     workflow, and lever prioritization.
 
 4. Inkling-2-Mini model architecture & tokenizer specification (Apache License 2.0)
    Thinking Machines / Inkling-2-Mini.

@@ -1,11 +1,11 @@
 # Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache License 2.0)
-# for squid5090 offline abliteration tooling.
-"""Reference Inkling-2-Mini for one RTX 5090.
+# for squidDGX offline abliteration tooling.
+"""Reference Inkling-2-Mini for one NVIDIA DGX Spark.
 
 This is the transformers PR model (huggingface/transformers#51050) with one change: the routed experts
 stay in their checkpoint encoding (NVFP4 in layers 0-19, MXFP8 in layers 20-23) and an expert is decoded
-only when a token routes to it. The PR decodes every expert to BF16 at load time (~52 GB), which does not
-fit in 32 GB. Decoding follows the PR's `Inkling2LoopDequantizeExperts` exactly (FP32 product, BF16 cast).
+only when a token routes to it. The PR decodes every expert to BF16 at load time (~52 GB).
+Decoding follows the PR's `Inkling2LoopDequantizeExperts` exactly (FP32 product, BF16 cast).
 
 It also owns two research hooks used by the abliteration tools:
 

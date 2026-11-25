@@ -116,7 +116,7 @@ __device__ __forceinline__ void mma_m16n8k16_f32_bf16(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
-// Hardware Blackwell sm_120 PTX FP4 (e2m1x2) -> half2 conversion!
+// Hardware GB10 PTX FP4 (e2m1x2) -> half2 conversion!
 // Single-instruction hardware decode on Blackwell (zero LUT / bitshift overhead).
 __device__ __forceinline__ __half2 cvt_e2m1x2_to_half2(uint32_t byte_val) {
     uint32_t out;
@@ -137,7 +137,7 @@ __device__ __forceinline__ __half2 cvt_e2m1x2_to_half2(uint32_t byte_val) {
     return *reinterpret_cast<__half2*>(&out);
 }
 
-// Unpack 8 FP4 weights (1 uint32) into 4x half2 with ZERO shifts/masks on Blackwell sm_120!
+// Unpack 8 FP4 weights (1 uint32) into 4x half2 with ZERO shifts/masks on GB10.
 __device__ __forceinline__ void cvt_e2m1x8_to_half2x4(
     uint32_t w, __half2& h0, __half2& h1, __half2& h2, __half2& h3) {
 #if __CUDA_ARCH__ >= 1000
@@ -211,6 +211,22 @@ __device__ __forceinline__ float fast_tanh(float x) {
     float y;
     asm("tanh.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
+}
+
+constexpr float SAMPLE_HIST_RANGE = 20.0f;
+constexpr float SAMPLE_HIST_SCALE = 256.0f / SAMPLE_HIST_RANGE;
+
+constexpr int SAMPLE_HIST_COUNT_BITS = 18;
+constexpr unsigned SAMPLE_HIST_COUNT_MASK = (1u << SAMPLE_HIST_COUNT_BITS) - 1;
+static_assert(VOCAB_UNPADDED <= SAMPLE_HIST_COUNT_MASK);
+
+// Low bits count vocabulary entries. The count cannot carry into the
+// fixed-point mass, so one shared atomic adds both quantities exactly.
+__device__ __forceinline__ void add_sample_histogram(float distance, unsigned long long* histogram) {
+    if (!(distance < SAMPLE_HIST_RANGE)) return;
+    const int bin = max(0, min(255, static_cast<int>(distance * SAMPLE_HIST_SCALE)));
+    const auto weight = static_cast<unsigned long long>(__expf(-distance) * 16777216.0f + 0.5f);
+    atomicAdd(&histogram[bin], (weight << SAMPLE_HIST_COUNT_BITS) | 1ull);
 }
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -305,12 +321,8 @@ __device__ __forceinline__ void ldmatrix_x2_trans(
                  : "=r"(r0), "=r"(r1) : "r"(addr));
 }
 
-// Split-K attention partial buffer offsets (NUM_HEADS=24, MAX_VERIFY_B=8, KV_TOTAL_SPLITS=65)
-constexpr size_t SPLIT_MD_ELEMS = (size_t)NUM_HEADS * 8 * KV_TOTAL_SPLITS; // 12480
-constexpr size_t SPLIT_M_OFF = 0;
-constexpr size_t SPLIT_D_OFF = SPLIT_MD_ELEMS;
-constexpr size_t SPLIT_O_OFF = 2 * SPLIT_MD_ELEMS; // 24960
-constexpr size_t SPLIT_BUF_FLOATS = SPLIT_O_OFF + SPLIT_MD_ELEMS * HEAD_DIM; // 1622400
+// Split-K attention partial buffer offsets are defined in config.hpp (single source of truth).
+constexpr size_t SPLIT_BUF_FLOATS = SPLIT_BUFFER_FLOATS;
 
 // Store one 128-dim KV head using 128 threads (tid = 0..127, 4 warps, caller provides sm[4]).
 // KV_FMT: 0 = BF16, 1 = FP8 (E4M3 + per-head half scale), 2 = Q4 ([-7..7]+7 + group-64 half scale).

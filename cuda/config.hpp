@@ -29,6 +29,7 @@ constexpr int R_DIM = NUM_HEADS * D_REL;        // 384
 constexpr int REL_EXTENT = 1024;
 constexpr int SWA_WINDOW = 1024;
 constexpr int CONV_TAPS = 4;
+constexpr int SCONV_RING_SLOTS = 16;
 
 constexpr int NUM_EXPERTS = 128;
 constexpr int TOP_K = 8;
@@ -36,6 +37,10 @@ constexpr int INTERMEDIATE = 1152;
 constexpr int VOCAB_PADDED = 201024;
 constexpr int VOCAB_UNPADDED = 200058;
 constexpr int EOS_TOKEN = 200006;
+
+constexpr uint64_t VRAM_ALIGNMENT = 256;
+constexpr int QRGS_OUT_DIM = Q_DIM + R_DIM + Q_DIM + NUM_HEADS; // 6552
+constexpr int DSPARK_QKV_OUT_DIM = Q_DIM + 2 * KV_DIM;          // 5120
 
 constexpr float RMS_EPS = 1e-6f;
 constexpr float QK_CLIP = 22.627416997969522f;
@@ -72,17 +77,45 @@ constexpr bool is_mtp_local_layer(int l) {
     return l == 0 || l == 2;
 }
 
-enum class QuantMode {
-    Exact, // Official checkpoint: NVFP4 L0-19, MXFP8 L20-23, BF16 dense & LM head
-    FP8,   // Official experts + FP8 E4M3 dense attention & LM head
-    NVFP4  // Aggressive all-NVFP4: L0-23 experts, dense attention, LM head, DSpark
+enum class QuantMode : uint8_t {
+    Exact = 0, // Official checkpoint: NVFP4 L0-19, MXFP8 L20-23, BF16 dense & LM head
+    FP8   = 1, // Official experts + FP8 E4M3 dense attention & LM head
+    NVFP4 = 2  // Aggressive all-NVFP4: L0-23 experts, dense attention, LM head, DSpark
 };
 
-enum class KVFormat {
+inline const char* quant_mode_name(QuantMode m) {
+    switch (m) {
+        case QuantMode::Exact: return "exact";
+        case QuantMode::FP8:   return "fp8";
+        case QuantMode::NVFP4: return "nvfp4";
+    }
+    return "nvfp4";
+}
+
+enum class KVFormat : uint8_t {
     BF16 = 0, // 2.000 B/elem (exact parity)
     FP8  = 1, // 1.016 B/elem (E4M3 + per-head FP16 scale -> up to 448K context)
     Q4   = 2  // 0.531 B/elem (signed INT4 [-7..7] + group-64 FP16 scale -> up to 1M context!)
 };
+
+inline const char* kv_format_name(KVFormat f) {
+    switch (f) {
+        case KVFormat::BF16: return "bf16";
+        case KVFormat::FP8:  return "fp8";
+        case KVFormat::Q4:   return "q4";
+    }
+    return "fp8";
+}
+
+static_assert(Q_DIM == 3072, "Q_DIM must be 3072");
+static_assert(KV_DIM == 1024, "KV_DIM must be 1024");
+static_assert(QRGS_OUT_DIM == 6552, "QRGS_OUT_DIM must be 6552");
+static_assert(HIDDEN % 32 == 0, "HIDDEN must be divisible by 32");
+static_assert(INTERMEDIATE % 32 == 0, "INTERMEDIATE must be divisible by 32");
+static_assert(MTP_INTERMEDIATE % 32 == 0, "MTP_INTERMEDIATE must be divisible by 32");
+static_assert(LOOP_START + (LOOP_END - LOOP_START) * LOOP_PASSES + (NUM_LAYERS - LOOP_END) == NUM_VISITS,
+              "visit schedule length must equal 48");
+static_assert(MTP_BLOCK_SIZE == MTP_MAX_DRAFTS + 1, "MTP_BLOCK_SIZE must equal MTP_MAX_DRAFTS + 1");
 
 // Device-resident sampling config (uploaded via H2D before generate; zero graph rebuild!)
 // inv_temp == 0.0f => pure greedy argmax with zero extra memory traffic.
@@ -94,9 +127,14 @@ struct SampleConfig {
     uint64_t seed;
 };
 
-constexpr int KV_SPLIT_K = 64;    // 8 KV heads x 64 bulk splits = 512 CTAs (3.0 blocks/SM!)
+constexpr int KV_SPLIT_K = 64;    // 8 KV heads x 64 bulk splits = 512 CTAs
 constexpr int KV_LOCAL_SPLITS = 17; // 17 x 64 = 1088 >= 1024+8 (1 single tile per CTA!)
 constexpr int KV_TOTAL_SPLITS = KV_SPLIT_K + KV_LOCAL_SPLITS; // 81 slots in split_buf
+constexpr size_t SPLIT_MD_ELEMS = static_cast<size_t>(NUM_HEADS) * MTP_BLOCK_SIZE * KV_TOTAL_SPLITS; // 15552
+constexpr size_t SPLIT_M_OFF = 0;
+constexpr size_t SPLIT_D_OFF = SPLIT_MD_ELEMS;
+constexpr size_t SPLIT_O_OFF = 2 * SPLIT_MD_ELEMS;
+constexpr size_t SPLIT_BUFFER_FLOATS = SPLIT_O_OFF + SPLIT_MD_ELEMS * HEAD_DIM; // 2021760 (single source of truth!)
 constexpr int KV_Q4_GROUP = 64;  // 2 groups per 128-dim head
 constexpr int KV_Q4_GROUPS_PER_HEAD = HEAD_DIM / KV_Q4_GROUP; // 2
 constexpr int KV_Q4_SCALES_PER_TOK = NUM_KV_HEADS * KV_Q4_GROUPS_PER_HEAD; // 16

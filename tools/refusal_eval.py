@@ -4,8 +4,8 @@
 # dependencies = []
 # ///
 # Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache License 2.0)
-# for squid5090 OpenAI-compatible serving.
-"""Refusal evaluation for a squid5090 OpenAI-compatible server.
+# for squidDGX OpenAI-compatible serving.
+"""Refusal evaluation for a squidDGX OpenAI-compatible server.
 
 Runs a fixed set of mild prompts that safety-tuned models commonly over-refuse, records the
 completion and whether it looks like a refusal, and can compare two runs (original vs abliterated).

@@ -452,6 +452,7 @@ void launch_dspark_draft(
     float* workspace,              // preallocated workspace for DSpark block & Markov head
     int32_t* out_draft_tokens,     // [num_drafts]
     float* out_draft_conf,         // optional [num_drafts] max softmax probability
+    float threshold,               // verify-width confidence cutoff
     const SampleConfig* sample_cfg,// optional device sampling config (inv_temp > 0 => stochastic draft!)
     float* out_draft_probs,        // optional [num_drafts, draft_vocab_size] normalized q_i(v)
     float* out_draft_q_sel,        // optional [num_drafts] q_i(out_draft_tokens[i])
@@ -507,6 +508,23 @@ void launch_prefill_copy_taps(
     float* dst_taps,
     int tap_slot,
     int B,
+    cudaStream_t stream);
+
+void launch_prefill_dspark_commit(
+    const DsparkWeights& dw,
+    const float* taps,
+    void* ctx_k[MTP_LAYERS],
+    void* ctx_v[MTP_LAYERS],
+    __half* ctx_ks[MTP_LAYERS],
+    __half* ctx_vs[MTP_LAYERS],
+    int ctx_cap[MTP_LAYERS],
+    KVFormat global_kv_fmt,
+    float* f_ring,
+    __half* scratch_mix_h,
+    float* scratch_kv,
+    __half* w_f16_scratch,
+    int B,
+    const int32_t* d_pos,
     cudaStream_t stream);
 
 void launch_prefill_local_sconv_prep_store(
@@ -618,5 +636,104 @@ void launch_prefill_moe_down_h(
     float* out_slots,
     int B,
     cudaStream_t stream);
+
+// --- Weight Packing, Fold, & Graph Utility Kernels (kernels_utils.cu) ---
+
+void launch_bf16_amax_accum(
+    const void* src_bf16_dev,
+    size_t elems,
+    float* d_amax_scratch,
+    cudaStream_t stream);
+
+void launch_pack_bf16_to_nvfp4_with_scale(
+    const void* src_bf16_dev,
+    void* dst_data,
+    uint8_t* dst_scales,
+    float global_scale,
+    int32_t rows,
+    int32_t cols,
+    cudaStream_t stream);
+
+float pack_bf16_to_nvfp4(
+    const void* src_bf16_dev,
+    void* dst_data,
+    uint8_t* dst_scales,
+    float* d_amax_scratch,
+    int32_t rows,
+    int32_t cols);
+
+void pack_bf16_to_fp8(
+    const void* src_bf16_dev,
+    void* dst_data,
+    float* dst_row_scales,
+    int32_t rows,
+    int32_t cols);
+
+void convert_mxfp8_to_nvfp4_experts(
+    const uint8_t* src_w,
+    const uint8_t* src_s,
+    uint8_t* dst_w,
+    uint8_t* dst_s,
+    float* dst_expert_scale,
+    int32_t n_experts,
+    int32_t rows,
+    int32_t cols);
+
+void split_dspark_rnn(
+    const void* src_bf16,
+    void* w_sp,
+    void* w_h,
+    void* w_f);
+
+void compute_dspark_fold(
+    const void* unembed_bf16,
+    const void* hidden_out_w,
+    const void* hidden_out_b,
+    float* fold_b,
+    void* fold_bf16_out,
+    int32_t V,
+    int32_t K,
+    int32_t R);
+
+void launch_inc_pos_and_copy_tok(
+    int32_t* d_pos,
+    int32_t* d_tok_in,
+    const int32_t* d_tok_out,
+    int32_t* result,
+    cudaStream_t stream);
+
+void launch_inc_pos_by(
+    int32_t* d_pos,
+    int32_t delta,
+    cudaStream_t stream);
+
+void launch_assemble_verify_tokens(
+    const int32_t* d_anchor,
+    const int32_t* d_drafts,
+    int32_t* d_tokens,
+    int32_t num_drafts,
+    cudaStream_t stream);
+
+struct AdaptiveGraph;
+
+cudaError_t adaptive_graph_create(
+    const int32_t* d_anchor,
+    const int32_t* d_drafts,
+    const float* d_draft_conf,
+    float threshold,
+    int32_t* d_tokens,
+    int32_t* d_chosen_width,
+    cudaStream_t stream,
+    AdaptiveGraph** out_graph);
+
+cudaError_t adaptive_graph_branch_begin(
+    AdaptiveGraph* graph,
+    int32_t branch_idx,
+    cudaStream_t stream);
+
+cudaError_t adaptive_graph_branch_end(cudaStream_t stream);
+cudaError_t adaptive_graph_instantiate(AdaptiveGraph* graph);
+cudaError_t adaptive_graph_launch(AdaptiveGraph* graph, cudaStream_t stream);
+void adaptive_graph_destroy(AdaptiveGraph* graph);
 
 } // namespace squid

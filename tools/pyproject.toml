@@ -1,7 +1,7 @@
 [project]
-name = "squid5090-tools"
+name = "squidDGX-tools"
 version = "0.1.0"
-description = "Optional offline Python abliteration and evaluation tools for squid5090 (core engine requires zero Python)"
+description = "Optional offline Python abliteration and evaluation tools for squidDGX (core engine requires zero Python)"
 requires-python = ">=3.11,<3.14"
 dependencies = [
     "torch>=2.10.0",

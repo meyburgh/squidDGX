@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Adapted from satellitedown/inkling-2-mini-abliterated-ingine (Apache License 2.0)
-# for squid5090 (TigerStyle Zig + Blackwell CUDA engine).
+# for squidDGX (TigerStyle Zig + Blackwell CUDA engine).
 """Abliteration of Inkling-2-Mini by detector-gated directional ablation of residual-stream writes.
 
     uv run --project tools tools/ablate.py directions --out W/directions.pt                 # per-visit harmful/harmless means, answer start
@@ -28,7 +28,7 @@ attention and MLP writes, and searches k_det and the blend of the directions.
 
 Data. Directions and detectors: the first 336 harmful and harmless training prompts and 128 more harmless
 ones. Search: refusals on the other 80 harmful training prompts and on 24 mild prompts, answered through
-`squid5090 serve` without and with reasoning; damage as the KL divergence from the original model on its own
+`squidDGX serve` without and with reasoning; damage as the KL divergence from the original model on its own
 greedy answers to 64 harmless prompts and on a slice of general text, teacher-forced in the reference model.
 `verify` reports on prompts and text that none of these steps used: the harmful_behaviors test split,
 JailbreakBench, the first 64 harmless test prompts and the first 8,192 tokens of the text.
@@ -387,7 +387,7 @@ def apply_ablation(runner: Runner, t: dict):
 
 
 def save_ablation(path, t: dict, metadata: dict):
-    """The safetensors file squid5090 loads via `--ablation`:
+    """The safetensors file squidDGX loads via `--ablation`:
     `attn_w`/`mlp_w` for the plain projection, otherwise `attn_weight`/`mlp_weight`, `attn_offset`/`mlp_offset`,
     `gate` and, with detectors, `attn_det`/`mlp_det` and `attn_threshold`/`mlp_threshold`."""
     from safetensors.torch import save_file
@@ -654,10 +654,10 @@ def cmd_baseline(args):
     print(f"baseline ({args.split}): {len(prompts)} harmless answers in {time.time() - t:.1f}s", flush=True)
 
 
-# ------------------------------------------------------------------------------ refusals through squid5090
+# ------------------------------------------------------------------------------ refusals through squidDGX
 
 def serve(server: str, model_dir, ablation: str | None, port: int, log: str):
-    """Starts `squid5090 serve` with the fast adaptive-MTP serving profile and waits for /health."""
+    """Starts `squidDGX serve` with the fast adaptive-MTP serving profile and waits for /health."""
     cmd = [
         server, "serve", str(model_dir),
         "--host", "127.0.0.1",
@@ -679,10 +679,10 @@ def serve(server: str, model_dir, ablation: str | None, port: int, log: str):
         except OSError:
             pass
         if proc.poll() is not None:
-            raise RuntimeError(f"squid5090 serve exited: {open(log).read()[-800:]}")
+            raise RuntimeError(f"squidDGX serve exited: {open(log).read()[-800:]}")
         time.sleep(0.5)
     proc.kill()
-    raise RuntimeError("squid5090 serve did not become ready")
+    raise RuntimeError("squidDGX serve did not become ready")
 
 
 def ask(port: int, prompt: str, thinking: bool, effort: str | None, max_tokens: int, answer_chars: int) -> tuple[str, str]:
@@ -732,7 +732,7 @@ def report_sets() -> dict:
 
 def engine_refusals(server: str, model_dir, port: int, ablation: str | None, sets: dict, log: str,
                     stop_direct: int | None = None) -> dict:
-    """Refusal counts per set, answered by `squid5090 serve` with an ablation file (None: original model).
+    """Refusal counts per set, answered by `squidDGX serve` with an ablation file (None: original model).
     Reasoning turns that never reach an answer are counted separately (`no_answer`). With stop_direct, the
     sets after `direct` are skipped once it has more refusals than that."""
     proc = serve(server, model_dir, ablation, port, log)
@@ -806,7 +806,7 @@ def cmd_kl(args):
 
 def cmd_search(args):
     """Batches of N parameter sets: their KL in the reference model (a child process, so that the GPU is free
-    again afterwards), then their refusals through `squid5090 serve`. Objectives: refusals, max of the two KLs."""
+    again afterwards), then their refusals through `squidDGX serve`. Objectives: refusals, max of the two KLs."""
     import optuna
     work = Path(args.work)
     sets = refusal_sets(args.direct_prompts, args.think_prompts, args.default_prompts)
@@ -888,14 +888,14 @@ def cmd_verify(args):
     def save():  # after every stage: a late failure keeps what was measured
         Path(args.out).write_text(json.dumps(report, indent=1) + "\n")
 
-    if args.server:  # through squid5090 first: the reference model below needs the whole GPU
-        report["squid5090"] = {}
+    if args.server:  # through squidDGX first: the reference model below needs the whole GPU
+        report["squidDGX"] = {}
         for label, ablation in (("original", None), ("ablated", args.ablation)):
             res = engine_refusals(args.server, args.model_dir, args.port, ablation, report_sets(),
                                   f"{args.out}.serve-{label}.log")
-            report["squid5090"][label] = res
+            report["squidDGX"][label] = res
             for name, r in res.items():
-                print(f"squid5090 {label:9s} {name:40s} refused {r['refused']:3d}/{r['n']}"
+                print(f"squidDGX {label:9s} {name:40s} refused {r['refused']:3d}/{r['n']}"
                       + (f" (no answer: {r['no_answer']})" if r["no_answer"] else ""), flush=True)
         save()
     runner = Runner(args.model_dir)
@@ -914,7 +914,7 @@ def cmd_verify(args):
             print(f"{name:13s} {label:9s} refused {sum(refused):3d}/{len(outs)}", flush=True)
         save()
     # with reasoning (low effort): refusals in the final answer, and answers missing within the token budget.
-    # Small batches: the turns are long, and 48 of them at once do not fit beside the model in 32 GB.
+    # Small batches: the turns are long, so cap the default batch size.
     chats = [runner.chat(p, effort="low") for p in sets["harmful_test"][:args.think_prompts]]
     end = runner.tok.convert_tokens_to_ids("<|content_model_end_sampling|>")
     for label, enabled in (("original", False), ("ablated", True)):
@@ -982,7 +982,7 @@ def main():
     p.add_argument("--think-prompts", type=int, default=32, help="harmful validation prompts answered with reasoning (of 48)")
     p.add_argument("--default-prompts", type=int, default=0,
                    help="harmful validation prompts answered with reasoning at the default effort (for finalists)")
-    p.add_argument("--server", default=str(ROOT / "zig-out/bin/squid5090"))
+    p.add_argument("--server", default=str(ROOT / "zig-out/bin/squidDGX"))
     p.add_argument("--model-dir", default=str(MODEL_DIR)); p.add_argument("--port", type=int, default=8019)
     p.add_argument("--enqueue", action="append", help="JSON parameters to evaluate first")
     p = sub.add_parser("show"); p.add_argument("--work", required=True); p.add_argument("--top", type=int, default=30)
@@ -994,7 +994,7 @@ def main():
     p.add_argument("--baseline", help="harmless answers of the original model (baseline): adds their KL")
     p.add_argument("--think-prompts", type=int, default=48); p.add_argument("--think-tokens", type=int, default=768)
     p.add_argument("--tokens", type=int, default=64)
-    p.add_argument("--server", help="squid5090 binary: adds the held-out prompts answered through squid5090 serve")
+    p.add_argument("--server", help="squidDGX binary: adds the held-out prompts answered through squidDGX serve")
     p.add_argument("--model-dir", default=str(MODEL_DIR)); p.add_argument("--port", type=int, default=8019)
     args = ap.parse_args()
     {"directions": cmd_directions, "stats": cmd_stats, "baseline": cmd_baseline, "kl": cmd_kl, "search": cmd_search,

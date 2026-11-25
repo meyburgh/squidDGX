@@ -1,4 +1,4 @@
-# Multi-Domain Long-Context KLD Evaluation Corpus (squid5090)
+# Multi-Domain Long-Context KLD Evaluation Corpus (squidDGX)
 # Designed to exercise both the 1,024-token sliding-window local attention layers
 # and the 8 global attention layers (positions > 1,024) across technical prose,
 # Python, C++/CUDA, Zig, mathematics, and analytical reasoning.
@@ -256,7 +256,7 @@ __device__ __forceinline__ void accumulate_prob_bucket(
 ```
 
 A third hazard occurs in Programmatic Dependent Launch (PDL) on Blackwell
-(`sm_120a`). When a producer kernel signals `griddepcontrol.launch_dependents`
+(`sm_121a`). When a producer kernel signals `griddepcontrol.launch_dependents`
 early, the dependent consumer kernel begins executing concurrently on available
 SMs. Any load from the producer's output buffer issued before
 `griddepcontrol.wait` can observe stale data from the previous decode step, and

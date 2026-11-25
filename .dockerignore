@@ -1,0 +1,9 @@
+*
+!Dockerfile
+!Makefile
+!src/
+!src/**
+!cuda/
+!cuda/**
+!tests/
+!tests/**

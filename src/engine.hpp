@@ -151,7 +151,7 @@ struct Engine {
     const LoadedModel* model = nullptr;
     uint32_t context_tokens_max = 0;
     bool use_graphs = true;
-    KVFormat kv_format = KVFormat::FP8;
+    KVFormat kv_format = KVFormat::BF16;
     int32_t current_position = 0;
     VisitInfo schedule[NUM_VISITS]{};
 

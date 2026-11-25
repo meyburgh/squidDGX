@@ -1044,7 +1044,8 @@ void handle_chat_completions(
     char req_model_buf[128], effort_buf[32], key_buf[128];
     std::string_view req_model = config.model_name;
     std::string_view effort = config.default_effort;
-    int32_t max_tokens = 16384;
+    const int32_t output_cap = static_cast<int32_t>(std::min(config.max_output_tokens, config.context_tokens_max));
+    int32_t max_tokens = output_cap;
     bool has_max_completion_tokens = false;
     float req_temp = config.default_temperature;
     float req_top_p = config.default_top_p;
@@ -1098,12 +1099,12 @@ void handle_chat_completions(
             }
         } else if (k == "max_completion_tokens") {
             if (parse_json_i64_opt(body, pos, &iv)) {
-                max_tokens = clamp_i64_to_i32(iv, 1, static_cast<int32_t>(config.context_tokens_max));
+                max_tokens = clamp_i64_to_i32(iv, 1, output_cap);
                 has_max_completion_tokens = true;
             }
         } else if (k == "max_tokens") {
             if (parse_json_i64_opt(body, pos, &iv) && !has_max_completion_tokens) {
-                max_tokens = clamp_i64_to_i32(iv, 1, static_cast<int32_t>(config.context_tokens_max));
+                max_tokens = clamp_i64_to_i32(iv, 1, output_cap);
             }
         } else if (k == "temperature") {
             if (parse_json_f64_opt(body, pos, &dv)) req_temp = static_cast<float>(dv);
@@ -1359,7 +1360,8 @@ void handle_text_completions(
     ++pos;
 
     std::string_view prompt;
-    int32_t max_tokens = 2048;
+    const int32_t output_cap = static_cast<int32_t>(std::min(config.max_output_tokens, config.context_tokens_max));
+    int32_t max_tokens = output_cap;
     float req_temp = config.default_temperature;
     float req_top_p = config.default_top_p;
     int32_t req_top_k = config.default_top_k;
@@ -1395,7 +1397,7 @@ void handle_text_completions(
             if (parse_json_string(body, pos, req_model_buf, sizeof(req_model_buf), &ms)) req_model = ms;
             else skip_json_value(body, pos);
         } else if (k == "max_tokens") {
-            if (parse_json_i64_opt(body, pos, &iv)) max_tokens = clamp_i64_to_i32(iv, 1, static_cast<int32_t>(config.context_tokens_max));
+            if (parse_json_i64_opt(body, pos, &iv)) max_tokens = clamp_i64_to_i32(iv, 1, output_cap);
         } else if (k == "temperature") {
             if (parse_json_f64_opt(body, pos, &dv)) req_temp = static_cast<float>(dv);
         } else if (k == "top_p") {
@@ -1587,7 +1589,8 @@ void handle_connection(
         ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
         bw.append_slice("{\"status\":\"ok\",\"model\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"max_context\":%u,\"mtp\":%u,\"engine\":\"squidDGX\"}", config.context_tokens_max, config.default_mtp);
+        bw.append_fmt(",\"max_context\":%u,\"max_output_tokens\":%u,\"mtp\":%u,\"engine\":\"squidDGX\"}",
+                      config.context_tokens_max, config.max_output_tokens, config.default_mtp);
         send_json_response(fd, 200, bw.slice());
         return;
     }
@@ -1607,8 +1610,8 @@ void handle_connection(
         ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
         bw.append_slice("{\"object\":\"list\",\"data\":[{\"id\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"object\":\"model\",\"created\":%lld,\"owned_by\":\"squidDGX\",\"max_model_len\":%u}]}",
-                      static_cast<long long>(epoch_seconds()), config.context_tokens_max);
+        bw.append_fmt(",\"object\":\"model\",\"created\":%lld,\"owned_by\":\"squidDGX\",\"max_model_len\":%u,\"max_output_tokens\":%u}]}",
+                      static_cast<long long>(epoch_seconds()), config.context_tokens_max, config.max_output_tokens);
         send_json_response(fd, 200, bw.slice());
         return;
     }
@@ -1699,10 +1702,10 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
     uint64_t prng_state = clock_monotonic_ns() ^ 0x9e3779b97f4a7c15ULL;
     if (prng_state == 0) prng_state = 0x9e3779b97f4a7c15ULL;
 
-    printf("[server] squidDGX C++20 OpenAI API listening on http://%.*s:%u/v1 (model=%.*s, ctx=%u, mtp=%u, zero-malloc=on)\n",
+    printf("[server] squidDGX C++20 OpenAI API listening on http://%.*s:%u/v1 (model=%.*s, ctx=%u, max_out=%u, mtp=%u, zero-malloc=on)\n",
            static_cast<int>(config.host.size()), config.host.data(), config.port,
            static_cast<int>(config.model_name.size()), config.model_name.data(),
-           config.context_tokens_max, config.default_mtp);
+           config.context_tokens_max, config.max_output_tokens, config.default_mtp);
     std::fflush(stdout);
 
     timeval sock_timeout{};

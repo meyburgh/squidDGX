@@ -15,11 +15,12 @@ struct ServerConfig {
     std::string_view model_name = "inkling-2-mini";
     std::string_view api_key = "";
     std::string_view default_effort = "none";
-    uint32_t default_mtp = 3;
+    uint32_t default_mtp = MTP_MAX_DRAFTS;
     float default_temperature = 1.0f;
     float default_top_p = 0.95f;
     int32_t default_top_k = 0;
-    uint32_t context_tokens_max = 65536;
+    uint32_t context_tokens_max = 262144;
+    uint32_t max_output_tokens = 65536;
     bool raw_thinking = false;
     bool keep_history_thinking = false;
 };

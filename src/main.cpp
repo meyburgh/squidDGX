@@ -27,12 +27,12 @@ void print_usage() {
     static constexpr std::string_view kUsage =
         "squidDGX — C++20 + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n"
         "Usage:\n"
-        "  squidDGX serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv auto|bf16|fp8|q4] [--ctx 65536] [--mtp 7] [--spec-threshold 0.75] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n"
-        "  squidDGX generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 128] [--ctx 8192]\n"
-        "  squidDGX bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode nvfp4] [--kv auto] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 8192]\n"
-        "  squidDGX longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv fp8|q4|bf16] [--ctx 1048576]\n"
-        "  squidDGX logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode nvfp4] [--kv auto] [--ctx 8192]\n"
-        "  squidDGX kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv auto|bf16|fp8|q4] [--ctx 8192]\n"
+        "  squidDGX serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode exact|fp8|nvfp4] [--kv bf16|auto|fp8|q4] [--ctx 262144] [--max-tokens 65536] [--mtp 7] [--spec-threshold 0.75] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n"
+        "  squidDGX generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--mode exact] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 65536] [--ctx 262144]\n"
+        "  squidDGX bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode exact] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 262144]\n"
+        "  squidDGX longctx  <model_dir> [--mode exact|fp8|nvfp4] [--kv bf16|fp8|q4] [--ctx 262144]\n"
+        "  squidDGX logits   <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --out FILE [--mode exact] [--kv bf16] [--ctx 262144]\n"
+        "  squidDGX kld      <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens-file PATH) --ref FILE [--mode exact|fp8|nvfp4] [--kv bf16|auto|fp8|q4] [--ctx 262144]\n"
         "  squidDGX tokenize <model_dir> (--prompt TEXT | --prompt-file PATH) [--raw]\n";
     squid::write_fd_all(2, kUsage);
 }
@@ -124,8 +124,8 @@ int main(int argc, char** argv) {
     std::string_view tokens_file;
     std::string_view prompt_text;
     std::string_view prompt_file;
-    std::string_view mode_str = "nvfp4";
-    std::string_view kv_str = "auto";
+    std::string_view mode_str = "exact";
+    std::string_view kv_str = "bf16";
     std::string_view host = "0.0.0.0";
     std::string_view model_name = "inkling-2-mini";
     bool model_name_explicit = false;
@@ -144,9 +144,9 @@ int main(int argc, char** argv) {
     float top_p = 0.95f;
     int32_t top_k = 0;
     uint64_t seed = 0;
-    uint32_t max_tokens = 128;
+    uint32_t max_tokens = (command == "bench") ? 128u : 65536u;
     uint32_t runs = 6;
-    uint32_t ctx = (command == "serve") ? 65536u : (command == "longctx") ? static_cast<uint32_t>(kCliTokensMax) : 8192u;
+    uint32_t ctx = 262144u;
     bool use_graphs = true;
     bool use_prompt_lookup = true;
     bool raw_prompt = false;
@@ -352,6 +352,7 @@ int main(int argc, char** argv) {
         scfg.default_top_p = top_p;
         scfg.default_top_k = top_k;
         scfg.context_tokens_max = ctx;
+        scfg.max_output_tokens = std::min(std::max(max_tokens, 1u), ctx);
         scfg.raw_thinking = raw_thinking;
         scfg.keep_history_thinking = keep_history_thinking;
         exit_code = squid::run_openai_server(engine, tokenizer, scfg);
@@ -507,13 +508,14 @@ int main(int argc, char** argv) {
             }
         }
     } else if (command == "longctx") {
-        static constexpr uint32_t kTestPositions[] = {1024, 16384, 32768, 65536, 131072, 262144, 393216, 524288, 786432, 1048000};
+        static constexpr uint32_t kTestPositions[] = {1024, 16384, 32768, 65536, 131072, 261888, 262144, 393216, 524288, 786432, 1048000};
         const double total_vram_gib = static_cast<double>(model.arena.capacity_bytes + engine.arena.capacity_bytes) / (1024.0 * 1024.0 * 1024.0);
         printf("=== LONG-CONTEXT SCALING (cpp, mode=%s, kv=%s, max_ctx=%u, total_VRAM=%.2f GiB) ===\n",
                squid::quant_mode_name(quant_mode), squid::kv_format_name(kv_format), ctx, total_vram_gib);
         printf("  %9s | %11s | %11s | %11s | %13s\n", "pos", "B=1 ms/tok", "B=1 tok/s", "B=4 ms/step", "B=4 @dl=2.5");
         for (uint32_t pos_val : kTestPositions) {
-            if (pos_val + 256 >= ctx) continue;
+            if (pos_val + 256 > ctx) continue;
+            if (pos_val == 261888 && ctx > 262144 + 256) continue;
             const double ms1 = engine.bench_step_at_pos(static_cast<int32_t>(pos_val), 0, 24);
             const double ms4 = engine.bench_step_at_pos(static_cast<int32_t>(pos_val), 3, 24);
             printf("  %9u | %8.2f ms | %7.1f t/s | %8.2f ms | %9.1f t/s\n",

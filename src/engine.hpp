@@ -37,6 +37,18 @@ struct GenerateStats {
     int32_t last_token_id = -1;
 };
 
+// Host-side token filter for constrained decoding (response_format). While `choose` is set,
+// generate() runs without speculative drafts and calls it for every token the GPU picked.
+// `choose` is first called with logits == nullptr: return `proposed` to accept it, another
+// token id to replace it, or kConstraintNeedLogits to be called again with that step's
+// post-softcap logits row copied into `host_logits` ([VOCAB_UNPADDED]).
+constexpr int32_t kConstraintNeedLogits = -2;
+struct TokenConstraint {
+    int32_t (*choose)(void* ctx, int32_t proposed, const float* logits) = nullptr;
+    void* ctx = nullptr;
+    float* host_logits = nullptr;
+};
+
 struct VisionInput {
     const float* d_embeds = nullptr;
     size_t count = 0;
@@ -295,6 +307,7 @@ struct Engine {
     float* p_ctrl_f = nullptr;
     float* p_ctrl_g = nullptr;
 
+    TokenConstraint constraint{};
     using VisionInput = squid::VisionInput;
     VisionInput active_vision{};
     size_t active_vision_cursor = 0;

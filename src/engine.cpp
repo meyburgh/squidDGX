@@ -793,13 +793,26 @@ GenerateStats Engine::generate_with_hint(
     if (out_cap > 0 && max_new_tokens > out_cap) max_new_tokens = static_cast<uint32_t>(out_cap);
 
     const ModelWeights& mw = model->mw;
-    const uint32_t num_drafts = std::min(num_drafts_in, static_cast<uint32_t>(MTP_MAX_DRAFTS));
+    const bool constrained = (constraint.choose != nullptr && constraint.host_logits != nullptr);
+    const uint32_t num_drafts = constrained ? 0u : std::min(num_drafts_in, static_cast<uint32_t>(MTP_MAX_DRAFTS));
     const bool use_mtp = (num_drafts > 0 && mw.dspark.loaded);
     const uint32_t prompt_len = static_cast<uint32_t>(prompt_len_in);
 
+    // Constrained decoding needs the logits row every step: a negative inv_temp keeps greedy
+    // argmax on the GPU but still writes post-softcap logits.
     const float inv_temp = (sample_params.temperature >= 1e-4f)
                                ? (1.0f / sample_params.temperature)
-                               : (out_first_logits != nullptr ? 1.0f : 0.0f);
+                               : (out_first_logits != nullptr ? 1.0f : (constrained ? -1.0f : 0.0f));
+    auto apply_constraint = [&](int32_t proposed, const float* d_row) -> int32_t {
+        int32_t r = constraint.choose(constraint.ctx, proposed, nullptr);
+        if (r == kConstraintNeedLogits) {
+            CUDA_CHECK(cudaMemcpyAsync(constraint.host_logits, d_row, static_cast<size_t>(VOCAB_UNPADDED) * sizeof(float),
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            r = constraint.choose(constraint.ctx, proposed, constraint.host_logits);
+        }
+        return (r >= 0 && r < VOCAB_UNPADDED) ? r : proposed;
+    };
     const SampleConfig cfg_h{
         inv_temp,
         sample_params.top_p,
@@ -949,6 +962,7 @@ GenerateStats Engine::generate_with_hint(
     }
     stats.prefill_ms = static_cast<double>(clock_monotonic_ns() - prefill_start_ns) / 1e6;
 
+    if (constrained) first_tok = apply_constraint(first_tok, lm_logits + static_cast<size_t>(last_batch - 1) * VOCAB_UNPADDED);
     if (out_cap > 0) out_tokens[0] = first_tok;
     stats.generated_tokens = 1;
     stats.last_token_id = first_tok;
@@ -986,7 +1000,15 @@ GenerateStats Engine::generate_with_hint(
             if (use_prefix_cache && shield_tokens == 0 && prefix_cache.session_len < context_tokens_max) {
                 prefix_cache.session_tokens[prefix_cache.session_len++] = prev_fed_tok;
             }
-            const int32_t tok = h_decode_result->tokens[0];
+            int32_t tok = h_decode_result->tokens[0];
+            if (constrained) {
+                const int32_t chosen = apply_constraint(tok, lm_logits);
+                if (chosen != tok) {
+                    tok = chosen;
+                    CUDA_CHECK(cudaMemcpyAsync(d_tokens, &tok, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                }
+            }
             prev_fed_tok = tok;
             if (out_cap > 0) out_tokens[stats.generated_tokens] = tok;
             stats.generated_tokens += 1;

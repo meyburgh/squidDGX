@@ -17,9 +17,9 @@ CUDA_SRCS := cuda/kernels_gemv.cu cuda/kernels_inkling.cu cuda/kernels_dspark.cu
              cuda/kernels_prefill.cu cuda/kernels_vision.cu cuda/kernels_utils.cu
 CUDA_OBJS := $(patsubst cuda/%.cu,$(BUILD_DIR)/cu_%.o,$(CUDA_SRCS))
 
-CPP_HDRS  := src/tiger.hpp src/vram_arena.hpp src/safetensors.hpp src/weights.hpp \
+CPP_HDRS  := src/tiger.hpp src/vram_arena.hpp src/safetensors.hpp src/weights.hpp src/json_constraint.hpp \
              src/tokenizer.hpp src/vision.hpp src/engine.hpp src/server.hpp
-CPP_SRCS  := src/safetensors.cpp src/weights.cpp src/tokenizer.cpp \
+CPP_SRCS  := src/safetensors.cpp src/weights.cpp src/tokenizer.cpp src/json_constraint.cpp \
              src/vision.cpp src/engine.cpp src/server.cpp src/main.cpp
 CPP_OBJS  := $(patsubst src/%.cpp,$(BUILD_DIR)/cpp_%.o,$(CPP_SRCS))
 
@@ -39,8 +39,8 @@ $(BUILD_DIR)/cpp_%.o: src/%.cpp $(CPP_HDRS) $(CUDA_HDRS) | $(BUILD_DIR)
 $(TARGET): $(CUDA_OBJS) $(CPP_OBJS)
 	$(CXX) $(CXXFLAGS) $^ -o $@ $(LDFLAGS)
 
-$(TEST_BIN): tests/test_unit.cpp src/tokenizer.cpp src/tiger.hpp src/tokenizer.hpp src/vram_arena.hpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS) tests/test_unit.cpp src/tokenizer.cpp -o $@ -lpthread -lm
+$(TEST_BIN): tests/test_unit.cpp src/tokenizer.cpp src/json_constraint.cpp src/json_constraint.hpp src/tiger.hpp src/tokenizer.hpp src/vram_arena.hpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) tests/test_unit.cpp src/tokenizer.cpp src/json_constraint.cpp -o $@ -lpthread -lm
 
 test: $(TEST_BIN)
 	./$(TEST_BIN)

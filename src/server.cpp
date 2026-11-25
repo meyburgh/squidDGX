@@ -1,4 +1,5 @@
 #include "server.hpp"
+#include "json_constraint.hpp"
 
 #include "tiger.hpp"
 
@@ -14,11 +15,15 @@
 #include <unistd.h>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <numeric>
+#include <condition_variable>
 #include <thread>
 #include <vector>
 
@@ -346,7 +351,6 @@ struct ToolCallRecord {
 };
 
 struct ServerBuffers {
-    char* request_buf = nullptr;
     char* render_buf = nullptr;
     char* response_buf = nullptr;
     char* content_buf = nullptr;
@@ -357,10 +361,10 @@ struct ServerBuffers {
     char* sse_buf = nullptr;
     int32_t* prompt_tokens = nullptr;
     float* logits_buf = nullptr;
+    int32_t* order_buf = nullptr;   // [VOCAB_UNPADDED] candidate ordering for constrained decoding
     TokenizerScratch tok_scratch{};
 
     void init() {
-        request_buf = alloc_host_zeroed<char>(kRequestBufferBytes);
         render_buf = alloc_host_zeroed<char>(kPromptRenderBytes);
         response_buf = alloc_host_zeroed<char>(kResponseBufferBytes);
         content_buf = alloc_host_zeroed<char>(kContentBufferBytes);
@@ -371,11 +375,11 @@ struct ServerBuffers {
         sse_buf = alloc_host_zeroed<char>(kSseFrameBytes);
         prompt_tokens = alloc_host_zeroed<int32_t>(kPromptTokensMax);
         logits_buf = alloc_host_zeroed<float>(VOCAB_UNPADDED);
+        order_buf = alloc_host_zeroed<int32_t>(VOCAB_UNPADDED);
         tok_scratch.init();
     }
 
     void deinit() {
-        free_host(request_buf);
         free_host(render_buf);
         free_host(response_buf);
         free_host(content_buf);
@@ -386,6 +390,7 @@ struct ServerBuffers {
         free_host(sse_buf);
         free_host(prompt_tokens);
         free_host(logits_buf);
+        free_host(order_buf);
         tok_scratch.deinit();
     }
 };
@@ -1097,6 +1102,145 @@ HttpReadResult read_http_request(int fd, char* buffer, size_t buf_cap) {
     return {HttpReadStatus::Ok, {method, path, auth_header, std::string_view(buffer + body_start, content_len)}, ""};
 }
 
+// response_format: picks every generated token so the final text is JSON (json_object) or
+// matches a JSON Schema (json_schema). Thinking, if enabled, is left free; only the text section
+// is constrained, and tool calls are not allowed.
+struct JsonConstraintCtx {
+    enum Phase : uint8_t { Pre, Text, Post };
+    const Tokenizer* tok = nullptr;
+    JsonMatcher matcher;
+    Phase phase = Pre;
+    float temperature = 0.0f;
+    float top_p = 1.0f;
+    int32_t top_k = 0;
+    uint64_t rng = 0x9e3779b97f4a7c15ULL;
+    int32_t* order = nullptr;
+    uint32_t replaced = 0;
+
+    void init(const Tokenizer* t, const JsonSchema* schema, bool thinking, const SampleParams& sp, int32_t* order_buf) {
+        tok = t;
+        matcher.init(schema);
+        phase = thinking ? Pre : Text;
+        temperature = sp.temperature;
+        top_p = (sp.top_p > 0.0f && sp.top_p <= 1.0f) ? sp.top_p : 1.0f;
+        top_k = sp.top_k;
+        rng = sp.seed ? sp.seed : 0x9e3779b97f4a7c15ULL;
+        order = order_buf;
+        replaced = 0;
+    }
+
+    bool valid(int32_t t) const {
+        switch (phase) {
+            case Pre:
+                return t != tok->id_eos && t != tok->id_tool_json;
+            case Text: {
+                if (t == tok->id_end_message || t == tok->id_eos) return matcher.can_end();
+                const std::string_view b = tok->decode_token_bytes(t, true);
+                return !b.empty() && matcher.accepts(b);
+            }
+            case Post:
+                return t == tok->id_eos;
+        }
+        return false;
+    }
+
+    void accept(int32_t t) {
+        if (phase == Pre) {
+            if (t == tok->id_text) phase = Text;
+            return;
+        }
+        if (phase == Text) {
+            if (t == tok->id_end_message || t == tok->id_eos) { phase = Post; return; }
+            (void)matcher.advance(tok->decode_token_bytes(t, true));
+        }
+    }
+
+    double next_unit() {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        return static_cast<double>(rng >> 11) * (1.0 / 9007199254740992.0);
+    }
+
+    int32_t choose(int32_t proposed, const float* logits) {
+        if (valid(proposed)) { accept(proposed); return proposed; }
+        if (phase == Post) { accept(tok->id_eos); return tok->id_eos; }
+        if (logits == nullptr) return kConstraintNeedLogits;
+        ++replaced;
+
+        const int32_t V = VOCAB_UNPADDED;
+        const int32_t want = (temperature < 1e-4f) ? 1 : (top_k > 0 ? std::min(top_k, 64) : 64);
+        constexpr int32_t kTop = 2048;
+        auto by_logit = [logits](int32_t a, int32_t b) { return logits[a] > logits[b]; };
+        std::iota(order, order + V, 0);
+        std::nth_element(order, order + kTop, order + V, by_logit);
+        std::sort(order, order + kTop, by_logit);
+        int32_t picked[64];
+        int32_t n = 0;
+        for (int32_t i = 0; i < kTop && n < want; ++i) {
+            if (valid(order[i])) picked[n++] = order[i];
+        }
+        if (n == 0) {
+            // Rare: nothing the model favours is valid here. Scan the rest of the vocabulary.
+            std::sort(order + kTop, order + V, by_logit);
+            for (int32_t i = kTop; i < V && n < want; ++i) {
+                if (valid(order[i])) picked[n++] = order[i];
+            }
+        }
+        if (n == 0) return proposed;  // nothing valid at all; leave the model's choice
+
+        int32_t choice = picked[0];
+        if (n > 1) {
+            double w[64];
+            double z = 0.0;
+            const double mx = logits[picked[0]];
+            for (int32_t i = 0; i < n; ++i) { w[i] = std::exp((logits[picked[i]] - mx) / temperature); z += w[i]; }
+            int32_t keep = n;
+            double cum = 0.0;
+            for (int32_t i = 0; i < n; ++i) {
+                cum += w[i] / z;
+                if (cum >= top_p) { keep = i + 1; break; }
+            }
+            double zk = 0.0;
+            for (int32_t i = 0; i < keep; ++i) zk += w[i];
+            double r = next_unit() * zk;
+            for (int32_t i = 0; i < keep; ++i) {
+                r -= w[i];
+                if (r <= 0.0) { choice = picked[i]; break; }
+            }
+        }
+        accept(choice);
+        return choice;
+    }
+
+    static int32_t choose_cb(void* ctx, int32_t proposed, const float* logits) {
+        return static_cast<JsonConstraintCtx*>(ctx)->choose(proposed, logits);
+    }
+};
+
+// Reads OpenAI `response_format`. Returns false (with *err) on an unusable value.
+bool parse_response_format(std::string_view raw, JsonSchema* schema, bool* active, const char** err) {
+    *active = false;
+    raw = trim_ascii_ws(raw);
+    if (raw.empty() || raw == "null") return true;
+    std::string_view type_raw;
+    if (raw[0] != '{' || !extract_raw_field(raw, "type", &type_raw)) { *err = "response_format must be an object with a type"; return false; }
+    type_raw = trim_ascii_ws(type_raw);
+    if (type_raw == "\"text\"") return true;
+    if (type_raw == "\"json_object\"") { schema->init_any_object(); *active = true; return true; }
+    if (type_raw == "\"json_schema\"") {
+        std::string_view js_raw, schema_raw;
+        if (!extract_raw_field(raw, "json_schema", &js_raw) || !extract_raw_field(trim_ascii_ws(js_raw), "schema", &schema_raw)) {
+            *err = "response_format.json_schema.schema is required";
+            return false;
+        }
+        std::string msg;
+        if (!schema->compile(trim_ascii_ws(schema_raw), &msg)) { *err = "response_format.json_schema.schema is not valid JSON"; return false; }
+        *active = true;
+        return true;
+    }
+    *err = "response_format.type must be text, json_object or json_schema";
+    return false;
+}
+
 void handle_chat_completions(
     int fd, std::string_view body, Engine& engine, const Tokenizer& tokenizer,
     const ServerConfig& config, ServerBuffers& buffers, uint64_t& prng_state) {
@@ -1123,6 +1267,7 @@ void handle_chat_completions(
     bool stream = false;
     bool include_usage = false;
     bool enable_thinking = true;
+    std::string_view response_format_raw;
     int32_t req_mtp = static_cast<int32_t>(config.default_mtp);
     StopList stops{};
 
@@ -1186,6 +1331,17 @@ void handle_chat_completions(
             stream = parse_json_bool(body, pos);
         } else if (k == "enable_thinking") {
             if (parse_json_bool_opt(body, pos, &bv)) enable_thinking = bv;
+        } else if (k == "chat_template_kwargs") {
+            const size_t start = pos; skip_json_value(body, pos);
+            std::string_view et;
+            if (extract_raw_field(body.substr(start, pos - start), "enable_thinking", &et)) {
+                et = trim_ascii_ws(et);
+                if (et == "false") enable_thinking = false;
+                else if (et == "true") enable_thinking = true;
+            }
+        } else if (k == "response_format") {
+            const size_t start = pos; skip_json_value(body, pos);
+            response_format_raw = body.substr(start, pos - start);
         } else if (k == "stream_options") {
             const size_t start = pos; skip_json_value(body, pos);
             include_usage = extract_bool_field(body.substr(start, pos - start), "include_usage");
@@ -1209,6 +1365,16 @@ void handle_chat_completions(
     if (!std::isfinite(req_top_p) || req_top_p <= 0.0f || req_top_p > 1.0f) req_top_p = 1.0f;
     if (req_top_k < 0) req_top_k = 0;
     req_mtp = std::clamp(req_mtp, 0, MTP_MAX_DRAFTS);
+
+    JsonSchema json_schema;
+    bool json_constrained = false;
+    {
+        const char* rf_err = nullptr;
+        if (!parse_response_format(response_format_raw, &json_schema, &json_constrained, &rf_err)) {
+            send_error_json(fd, 400, rf_err, "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+            return;
+        }
+    }
 
     RequestImages req_images{};
     const ChatEncodeResult enc = encode_chat_template_zero_alloc(
@@ -1264,6 +1430,17 @@ void handle_chat_completions(
         prng_state = prng_state * 6364136223846793005ULL + 1;
     }
     engine.sample_params = {req_temp, req_top_p, req_top_k, req_seed};
+
+    struct ConstraintGuard {
+        Engine& e;
+        ~ConstraintGuard() { e.constraint = {}; }
+    } constraint_guard{engine};
+    JsonConstraintCtx json_ctx{};
+    if (json_constrained) {
+        json_ctx.init(&tokenizer, &json_schema, enable_thinking, engine.sample_params, buffers.order_buf);
+        engine.constraint = {&JsonConstraintCtx::choose_cb, &json_ctx, buffers.logits_buf};
+        req_mtp = 0;
+    }
 
     if (!stream) {
         struct NonStreamCtx {
@@ -2336,20 +2513,51 @@ void handle_semif_score(
     send_json_response(fd, 200, bw.slice());
 }
 
+// --- Connection handling ----------------------------------------------------------------------
+// One engine, many connections: each accepted connection gets a worker thread and a slot that
+// owns its request buffer and a small reply buffer. Cheap endpoints (/health, /v1/models,
+// OPTIONS, errors) answer at once from the slot; engine endpoints take g_engine_mutex and use the
+// shared ServerBuffers, so they run one at a time in arrival order (std::mutex is not FIFO, but
+// the router sends one request per target at a time). With every slot taken, a new connection
+// gets an immediate 503 instead of waiting unanswered in the listen backlog.
+constexpr int kConnSlots = 8;
+constexpr size_t kSmallBufBytes = 64 * 1024;
+
+struct ConnSlot {
+    char* request_buf = nullptr;
+    char* small_buf = nullptr;
+    bool in_use = false;
+};
+
+std::mutex g_engine_mutex;
+std::atomic<bool> g_engine_busy{false};
+std::atomic<int> g_engine_waiting{0};
+
+struct EngineLock {
+    std::unique_lock<std::mutex> lk;
+    EngineLock() {
+        g_engine_waiting.fetch_add(1, std::memory_order_relaxed);
+        lk = std::unique_lock<std::mutex>(g_engine_mutex);
+        g_engine_waiting.fetch_sub(1, std::memory_order_relaxed);
+        g_engine_busy.store(true, std::memory_order_relaxed);
+    }
+    ~EngineLock() { g_engine_busy.store(false, std::memory_order_relaxed); }
+};
+
 void handle_connection(
     int fd, Engine& engine, const Tokenizer& tokenizer,
-    const ServerConfig& config, ServerBuffers& buffers, uint64_t& prng_state, bool is_semif_port) {
-    const HttpReadResult rr = read_http_request(fd, buffers.request_buf, kRequestBufferBytes);
+    const ServerConfig& config, ServerBuffers& buffers, ConnSlot& slot, uint64_t& prng_state, bool is_semif_port) {
+    const HttpReadResult rr = read_http_request(fd, slot.request_buf, kRequestBufferBytes);
     if (rr.status == HttpReadStatus::BadRequest) {
-        send_error_json(fd, 400, rr.err_msg, "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+        send_error_json(fd, 400, rr.err_msg, "invalid_request_error", slot.small_buf, kSmallBufBytes);
         return;
     }
     if (rr.status == HttpReadStatus::PayloadTooLarge) {
-        send_error_json(fd, 413, "Request body exceeds 32 MiB static HTTP buffer", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+        send_error_json(fd, 413, "Request body exceeds 32 MiB static HTTP buffer", "invalid_request_error", slot.small_buf, kSmallBufBytes);
         return;
     }
     if (rr.status == HttpReadStatus::NotImplemented) {
-        send_error_json(fd, 501, rr.err_msg, "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+        send_error_json(fd, 501, rr.err_msg, "invalid_request_error", slot.small_buf, kSmallBufBytes);
         return;
     }
     if (rr.status != HttpReadStatus::Ok) return;
@@ -2367,7 +2575,7 @@ void handle_connection(
 
     if (is_semif_port) {
         if (req.method == "GET" && req.path == "/health") {
-            ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+            ByteWriter bw(slot.small_buf, kSmallBufBytes);
             bw.append_fmt("{\"native_model\":\"Inkling-2-Mini\",\"weights_id\":\"%.*s\",\"backend\":\"squidDGX\",\"port\":%u,"
                           "\"prompt_version\":\"direct-options-v1\",\"model\":{\"native_model\":\"Inkling-2-Mini\",\"weights_id\":\"%.*s\",\"backend\":\"squidDGX\"}}",
                           static_cast<int>(config.weights_id.size()), config.weights_id.data(), config.semif_port,
@@ -2376,21 +2584,24 @@ void handle_connection(
             return;
         }
         if (req.method == "POST" && req.path == "/score") {
-            handle_semif_score(fd, req.body, engine, tokenizer, config, buffers);
+            EngineLock engine_lock;
+        handle_semif_score(fd, req.body, engine, tokenizer, config, buffers);
             return;
         }
-        ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+        ByteWriter bw(slot.small_buf, kSmallBufBytes);
         bw.append_slice("{\"error\":\"not found\"}");
         send_json_response(fd, 404, bw.slice());
         return;
     }
 
     if (req.method == "GET" && req.path == "/health") {
-        ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+        ByteWriter bw(slot.small_buf, kSmallBufBytes);
         bw.append_slice("{\"status\":\"ok\",\"model\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"max_context\":%u,\"max_output_tokens\":%u,\"mtp\":%u,\"engine\":\"squidDGX\"}",
-                      config.context_tokens_max, config.max_output_tokens, config.default_mtp);
+        bw.append_fmt(",\"max_context\":%u,\"max_output_tokens\":%u,\"mtp\":%u,\"engine\":\"squidDGX\",\"busy\":%s,\"queued\":%d}",
+                      config.context_tokens_max, config.max_output_tokens, config.default_mtp,
+                      g_engine_busy.load(std::memory_order_relaxed) ? "true" : "false",
+                      g_engine_waiting.load(std::memory_order_relaxed));
         send_json_response(fd, 200, bw.slice());
         return;
     }
@@ -2401,13 +2612,13 @@ void handle_connection(
                                 req.auth_header.substr(0, kPrefix.size()) == kPrefix &&
                                 constant_time_eql(req.auth_header.substr(kPrefix.size()), config.api_key);
         if (!authorized) {
-            send_error_json(fd, 401, "Invalid API key", "authentication_error", buffers.response_buf, kResponseBufferBytes);
+            send_error_json(fd, 401, "Invalid API key", "authentication_error", slot.small_buf, kSmallBufBytes);
             return;
         }
     }
 
     if (req.method == "GET" && (req.path == "/v1/models" || req.path == "/models")) {
-        ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+        ByteWriter bw(slot.small_buf, kSmallBufBytes);
         bw.append_slice("{\"object\":\"list\",\"data\":[{\"id\":");
         bw.append_json_escaped(config.model_name);
         bw.append_fmt(",\"object\":\"model\",\"created\":%lld,\"owned_by\":\"squidDGX\",\"max_model_len\":%u,\"max_output_tokens\":%u}]}",
@@ -2417,31 +2628,36 @@ void handle_connection(
     }
 
     if (req.method == "POST" && (req.path == "/v1/chat/completions" || req.path == "/chat/completions")) {
+        EngineLock engine_lock;
         handle_chat_completions(fd, req.body, engine, tokenizer, config, buffers, prng_state);
         return;
     }
 
     if (req.method == "POST" && (req.path == "/v1/completions" || req.path == "/completions")) {
+        EngineLock engine_lock;
         handle_text_completions(fd, req.body, engine, tokenizer, config, buffers, prng_state);
         return;
     }
 
     if (req.method == "POST" && (req.path == "/tokenize" || req.path == "/v1/tokenize")) {
+        EngineLock engine_lock;
         handle_tokenize(fd, req.body, tokenizer, config, buffers);
         return;
     }
 
     if (req.method == "POST" && (req.path == "/detokenize" || req.path == "/v1/detokenize")) {
+        EngineLock engine_lock;
         handle_detokenize(fd, req.body, tokenizer, buffers);
         return;
     }
 
     if (req.method == "POST" && req.path == "/score") {
+        EngineLock engine_lock;
         handle_semif_score(fd, req.body, engine, tokenizer, config, buffers);
         return;
     }
 
-    send_error_json(fd, 404, "Unknown endpoint", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+    send_error_json(fd, 404, "Unknown endpoint", "invalid_request_error", slot.small_buf, kSmallBufBytes);
 }
 
 } // namespace
@@ -2594,6 +2810,14 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
     }
     std::fflush(stdout);
 
+    ConnSlot slots[kConnSlots];
+    std::mutex slots_mu;
+    std::atomic<int> active_conns{0};
+    for (auto& sl : slots) {
+        sl.request_buf = alloc_host_zeroed<char>(kRequestBufferBytes);
+        sl.small_buf = alloc_host_zeroed<char>(kSmallBufBytes);
+    }
+
     timeval sock_timeout{};
     sock_timeout.tv_sec = 30;
     sock_timeout.tv_usec = 0;
@@ -2619,12 +2843,41 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
             (void)::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &sock_timeout, sizeof(sock_timeout));
             (void)::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &sock_timeout, sizeof(sock_timeout));
 
-            handle_connection(client_fd, engine, tokenizer, config, buffers, prng_state, pfds[i].fd == semif_fd);
-            ::close(client_fd);
+            ConnSlot* slot = nullptr;
+            {
+                std::lock_guard<std::mutex> g(slots_mu);
+                for (auto& sl : slots) if (!sl.in_use) { sl.in_use = true; slot = &sl; break; }
+            }
+            if (!slot) {
+                (void)send_all(client_fd,
+                    "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nRetry-After: 1\r\n"
+                    "Content-Length: 72\r\nConnection: close\r\n\r\n"
+                    "{\"error\":{\"message\":\"server busy\",\"type\":\"server_error\",\"code\":\"busy\"}}\n");
+                ::close(client_fd);
+                continue;
+            }
+            const bool on_semif = (pfds[i].fd == semif_fd);
+            active_conns.fetch_add(1, std::memory_order_acq_rel);
+            std::thread([&, client_fd, slot, on_semif] {
+                handle_connection(client_fd, engine, tokenizer, config, buffers, *slot, prng_state, on_semif);
+                ::close(client_fd);
+                {
+                    std::lock_guard<std::mutex> g(slots_mu);
+                    slot->in_use = false;
+                }
+                active_conns.fetch_sub(1, std::memory_order_acq_rel);
+            }).detach();
         }
     }
 
-    buffers.deinit();
+    // Let in-flight connections finish (they reference the buffers below); give up after 30 s.
+    for (int w = 0; w < 300 && active_conns.load(std::memory_order_acquire) > 0; ++w) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    if (active_conns.load(std::memory_order_acquire) == 0) {
+        buffers.deinit();
+        for (auto& sl : slots) { free_host(sl.request_buf); free_host(sl.small_buf); }
+    }
     int rem_fd = g_listen_fd.exchange(-1, std::memory_order_acq_rel);
     if (rem_fd >= 0) ::close(rem_fd);
     int rem_sfd = g_semif_fd.exchange(-1, std::memory_order_acq_rel);

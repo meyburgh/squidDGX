@@ -138,6 +138,8 @@ int main(int argc, char** argv) {
     if (const char* env_key = std::getenv("SQUID_API_KEY")) api_key = env_key;
 
     uint16_t port = 8000;
+    uint16_t semif_port = 8897;
+    uint32_t semif_max_tokens = 16384;
     const bool generation_command = (command == "serve" || command == "generate" || command == "bench");
     uint32_t mtp = generation_command ? static_cast<uint32_t>(squid::MTP_MAX_DRAFTS) : 0;
     float spec_threshold = 0.75f;
@@ -172,6 +174,8 @@ int main(int argc, char** argv) {
         else if (arg == "--kv" && has_val()) { kv_str = argv[++arg_i]; }
         else if (arg == "--host" && has_val()) { host = argv[++arg_i]; }
         else if (arg == "--port" && has_val()) { port = static_cast<uint16_t>(std::strtoul(argv[++arg_i], nullptr, 10)); }
+        else if (arg == "--semif-port" && has_val()) { semif_port = static_cast<uint16_t>(std::strtoul(argv[++arg_i], nullptr, 10)); }
+        else if (arg == "--semif-max-tokens" && has_val()) { semif_max_tokens = static_cast<uint32_t>(std::strtoul(argv[++arg_i], nullptr, 10)); }
         else if (arg == "--model-name" && has_val()) { model_name = argv[++arg_i]; model_name_explicit = true; }
         else if (arg == "--ablation" && has_val()) { ablation_path = argv[++arg_i]; }
         else if (arg == "--out" && has_val()) { out_path = argv[++arg_i]; }
@@ -383,6 +387,8 @@ int main(int argc, char** argv) {
         squid::ServerConfig scfg{};
         scfg.host = host;
         scfg.port = port;
+        scfg.semif_port = semif_port;
+        scfg.semif_max_tokens = semif_max_tokens;
         scfg.model_name = model_name;
         scfg.api_key = api_key;
         scfg.default_effort = effort;

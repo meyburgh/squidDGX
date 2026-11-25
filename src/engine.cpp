@@ -769,8 +769,9 @@ GenerateStats Engine::generate(
     uint32_t max_new_tokens, uint32_t num_drafts,
     int32_t* out_tokens, size_t out_cap,
     TokenCallbackFn on_token, void* cb_ctx,
-    VisionInput vision) {
-    return generate_with_hint(prompt, prompt_len, 0, max_new_tokens, num_drafts, out_tokens, out_cap, on_token, cb_ctx, vision);
+    VisionInput vision,
+    float* out_first_logits) {
+    return generate_with_hint(prompt, prompt_len, 0, max_new_tokens, num_drafts, out_tokens, out_cap, on_token, cb_ctx, vision, out_first_logits);
 }
 
 GenerateStats Engine::generate_with_hint(
@@ -779,7 +780,8 @@ GenerateStats Engine::generate_with_hint(
     uint32_t max_new_tokens_in, uint32_t num_drafts_in,
     int32_t* out_tokens, size_t out_cap,
     TokenCallbackFn on_token, void* cb_ctx,
-    VisionInput vision) {
+    VisionInput vision,
+    float* out_first_logits) {
     SQUID_ASSERT(model != nullptr);
     GenerateStats stats{};
     stats.prompt_tokens = static_cast<uint32_t>(prompt_len_in);
@@ -795,8 +797,11 @@ GenerateStats Engine::generate_with_hint(
     const bool use_mtp = (num_drafts > 0 && mw.dspark.loaded);
     const uint32_t prompt_len = static_cast<uint32_t>(prompt_len_in);
 
+    const float inv_temp = (sample_params.temperature >= 1e-4f)
+                               ? (1.0f / sample_params.temperature)
+                               : (out_first_logits != nullptr ? 1.0f : 0.0f);
     const SampleConfig cfg_h{
-        sample_params.temperature >= 1e-4f ? (1.0f / sample_params.temperature) : 0.0f,
+        inv_temp,
         sample_params.top_p,
         sample_params.top_k,
         0,
@@ -920,6 +925,13 @@ GenerateStats Engine::generate_with_hint(
 
     int32_t first_tok = 0;
     CUDA_CHECK(cudaMemcpyAsync(&first_tok, d_next_tokens + (last_batch - 1), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    if (out_first_logits != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            out_first_logits,
+            lm_logits + static_cast<size_t>(last_batch - 1) * VOCAB_UNPADDED,
+            static_cast<size_t>(VOCAB_UNPADDED) * sizeof(float),
+            cudaMemcpyDeviceToHost, stream));
+    }
     CUDA_CHECK(cudaMemcpyAsync(d_pos, &current_position, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 

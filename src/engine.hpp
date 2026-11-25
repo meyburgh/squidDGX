@@ -315,7 +315,8 @@ struct Engine {
         uint32_t max_new_tokens, uint32_t num_drafts,
         int32_t* out_tokens, size_t out_cap,
         TokenCallbackFn on_token = nullptr, void* cb_ctx = nullptr,
-        VisionInput vision = {});
+        VisionInput vision = {},
+        float* out_first_logits = nullptr);
 
     GenerateStats generate_with_hint(
         const int32_t* prompt, size_t prompt_len,
@@ -323,7 +324,8 @@ struct Engine {
         uint32_t max_new_tokens, uint32_t num_drafts,
         int32_t* out_tokens, size_t out_cap,
         TokenCallbackFn on_token = nullptr, void* cb_ctx = nullptr,
-        VisionInput vision = {});
+        VisionInput vision = {},
+        float* out_first_logits = nullptr);
 
     double bench_step_at_pos(int32_t sim_pos, uint32_t num_drafts, uint32_t iterations);
 

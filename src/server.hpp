@@ -12,6 +12,8 @@ namespace squid {
 struct ServerConfig {
     std::string_view host = "0.0.0.0";
     uint16_t port = 8000;
+    uint16_t semif_port = 8897;
+    uint32_t semif_max_tokens = 16384;
     std::string_view model_name = "inkling-2-mini";
     std::string_view api_key = "";
     std::string_view default_effort = "none";

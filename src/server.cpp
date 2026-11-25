@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -37,11 +38,14 @@ constexpr size_t kMaxImagesPerRequest = 16;
 
 std::atomic<bool> g_stop_requested{false};
 std::atomic<int> g_listen_fd{-1};
+std::atomic<int> g_semif_fd{-1};
 
 void handle_signal(int) {
     g_stop_requested.store(true, std::memory_order_release);
     int fd = g_listen_fd.exchange(-1, std::memory_order_acq_rel);
     if (fd >= 0) ::close(fd);
+    int sfd = g_semif_fd.exchange(-1, std::memory_order_acq_rel);
+    if (sfd >= 0) ::close(sfd);
 }
 
 void fill_random_hex(uint64_t& state, char* out, size_t len) {
@@ -347,6 +351,7 @@ struct ServerBuffers {
     char* scratch_str_buf = nullptr;
     char* sse_buf = nullptr;
     int32_t* prompt_tokens = nullptr;
+    float* logits_buf = nullptr;
     TokenizerScratch tok_scratch{};
 
     void init() {
@@ -360,6 +365,7 @@ struct ServerBuffers {
         scratch_str_buf = alloc_host_zeroed<char>(kScratchStringBytes);
         sse_buf = alloc_host_zeroed<char>(kSseFrameBytes);
         prompt_tokens = alloc_host_zeroed<int32_t>(kPromptTokensMax);
+        logits_buf = alloc_host_zeroed<float>(VOCAB_UNPADDED);
         tok_scratch.init();
     }
 
@@ -374,6 +380,7 @@ struct ServerBuffers {
         free_host(scratch_str_buf);
         free_host(sse_buf);
         free_host(prompt_tokens);
+        free_host(logits_buf);
         tok_scratch.deinit();
     }
 };
@@ -1442,6 +1449,8 @@ void handle_text_completions(
     ++pos;
 
     std::string_view prompt;
+    bool has_token_prompt = false;
+    size_t token_prompt_len = 0;
     const int32_t output_cap = static_cast<int32_t>(std::min(config.max_output_tokens, config.context_tokens_max));
     int32_t max_tokens = output_cap;
     float req_temp = config.default_temperature;
@@ -1451,6 +1460,11 @@ void handle_text_completions(
     uint64_t req_seed = 0;
     bool stream = false;
     bool echo = false;
+    int32_t req_logprobs = 0;
+    bool return_tokens_as_token_ids = false;
+    struct LogitBiasEntry { int32_t token_id; float bias; };
+    LogitBiasEntry logit_biases[128]{};
+    size_t logit_bias_count = 0;
     int32_t req_mtp = static_cast<int32_t>(config.default_mtp);
     char req_model_buf[128], key_buf[128];
     std::string_view req_model = config.model_name;
@@ -1468,9 +1482,27 @@ void handle_text_completions(
 
         int64_t iv = 0;
         double dv = 0.0;
+        bool bv = false;
         if (k == "prompt") {
             if (pos < body.size() && body[pos] == '"') {
                 if (!parse_json_string(body, pos, buffers.render_buf, kPromptRenderBytes, &prompt)) prompt = {};
+            } else if (pos < body.size() && body[pos] == '[') {
+                ++pos;
+                has_token_prompt = true;
+                token_prompt_len = 0;
+                while (pos < body.size()) {
+                    skip_ws(body, pos);
+                    if (pos >= body.size()) break;
+                    if (body[pos] == ']') { ++pos; break; }
+                    int64_t tid = 0;
+                    if (parse_json_i64_opt(body, pos, &tid) && tid >= 0 && tid < VOCAB_UNPADDED) {
+                        if (token_prompt_len < kPromptTokensMax) {
+                            buffers.prompt_tokens[token_prompt_len++] = static_cast<int32_t>(tid);
+                        }
+                    }
+                    skip_ws(body, pos);
+                    if (pos < body.size() && body[pos] == ',') ++pos;
+                }
             } else {
                 skip_json_value(body, pos);
             }
@@ -1492,6 +1524,45 @@ void handle_text_completions(
             stream = parse_json_bool(body, pos);
         } else if (k == "echo") {
             echo = parse_json_bool(body, pos);
+        } else if (k == "logprobs") {
+            if (pos < body.size() && (body[pos] == 't' || body[pos] == 'f')) {
+                if (parse_json_bool_opt(body, pos, &bv)) req_logprobs = bv ? 1 : 0;
+            } else if (parse_json_i64_opt(body, pos, &iv)) {
+                req_logprobs = clamp_i64_to_i32(iv, 0, 64);
+            }
+        } else if (k == "return_tokens_as_token_ids") {
+            return_tokens_as_token_ids = parse_json_bool(body, pos);
+        } else if (k == "logit_bias") {
+            if (pos < body.size() && body[pos] == '{') {
+                ++pos;
+                char bk_buf[32];
+                for (uint32_t bi = 0; pos < body.size() && bi < 256; ++bi) {
+                    skip_ws(body, pos);
+                    if (pos >= body.size()) break;
+                    if (body[pos] == '}') { ++pos; break; }
+                    std::string_view bk;
+                    if (!parse_json_string(body, pos, bk_buf, sizeof(bk_buf), &bk)) { skip_json_value(body, pos); break; }
+                    skip_ws(body, pos);
+                    if (pos < body.size() && body[pos] == ':') ++pos;
+                    double bval = 0.0;
+                    if (parse_json_f64_opt(body, pos, &bval) && logit_bias_count < 128) {
+                        char tid_z[32];
+                        if (!bk.empty() && bk.size() < sizeof(tid_z)) {
+                            std::memcpy(tid_z, bk.data(), bk.size());
+                            tid_z[bk.size()] = '\0';
+                            char* endp = nullptr;
+                            long long tid = std::strtoll(tid_z, &endp, 10);
+                            if (endp == tid_z + bk.size() && tid >= 0 && tid < VOCAB_UNPADDED) {
+                                logit_biases[logit_bias_count++] = {static_cast<int32_t>(tid), static_cast<float>(bval)};
+                            }
+                        }
+                    }
+                    skip_ws(body, pos);
+                    if (pos < body.size() && body[pos] == ',') ++pos;
+                }
+            } else {
+                skip_json_value(body, pos);
+            }
         } else if (k == "mtp") {
             if (parse_json_i64_opt(body, pos, &iv)) req_mtp = clamp_i64_to_i32(iv, 0, MTP_MAX_DRAFTS);
         } else if (k == "stop") {
@@ -1503,8 +1574,18 @@ void handle_text_completions(
         if (pos < body.size() && body[pos] == ',') ++pos;
     }
 
-    if (prompt.empty()) {
-        send_error_json(fd, 400, "'prompt' must be a non-empty string", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+    size_t prompt_len = 0;
+    if (has_token_prompt) {
+        prompt_len = token_prompt_len;
+    } else if (!prompt.empty()) {
+        prompt_len = tokenizer.encode_into(prompt, true, buffers.tok_scratch, buffers.prompt_tokens, kPromptTokensMax);
+    }
+    if (prompt_len == 0) {
+        send_error_json(fd, 400, "'prompt' must be a non-empty string or token ID array", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+        return;
+    }
+    if (prompt_len >= config.context_tokens_max) {
+        send_error_json(fd, 400, "Prompt exceeds max_context", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
         return;
     }
     if (max_tokens < 1) max_tokens = 1;
@@ -1512,12 +1593,6 @@ void handle_text_completions(
     if (!std::isfinite(req_top_p) || req_top_p <= 0.0f || req_top_p > 1.0f) req_top_p = 1.0f;
     if (req_top_k < 0) req_top_k = 0;
     req_mtp = std::clamp(req_mtp, 0, MTP_MAX_DRAFTS);
-
-    const size_t prompt_len = tokenizer.encode_into(prompt, true, buffers.tok_scratch, buffers.prompt_tokens, kPromptTokensMax);
-    if (prompt_len == 0 || prompt_len >= config.context_tokens_max) {
-        send_error_json(fd, 400, "Prompt exceeds max_context", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
-        return;
-    }
     const uint32_t gen_limit = std::min<uint32_t>(static_cast<uint32_t>(max_tokens),
                                                   config.context_tokens_max - static_cast<uint32_t>(prompt_len));
 
@@ -1534,6 +1609,96 @@ void handle_text_completions(
         prng_state = prng_state * 6364136223846793005ULL + 1;
     }
     engine.sample_params = {req_temp, req_top_p, req_top_k, req_seed};
+
+    if (!stream && gen_limit == 1 && (req_logprobs > 0 || logit_bias_count > 0)) {
+        const GenerateStats stats = engine.generate_with_hint(
+            buffers.prompt_tokens, prompt_len, 0, 1, 0, nullptr, 0, nullptr, nullptr, VisionInput{}, buffers.logits_buf);
+
+        float* logits = buffers.logits_buf;
+        for (size_t bi = 0; bi < logit_bias_count; ++bi) {
+            logits[logit_biases[bi].token_id] += logit_biases[bi].bias;
+        }
+        const double inv_t = (req_temp >= 1e-4f) ? (1.0 / static_cast<double>(req_temp)) : 1.0;
+        double max_l = -1e300;
+        for (int v = 0; v < VOCAB_UNPADDED; ++v) {
+            const double lv = static_cast<double>(logits[v]) * inv_t;
+            if (lv > max_l) max_l = lv;
+        }
+        double sum_exp = 0.0;
+        for (int v = 0; v < VOCAB_UNPADDED; ++v) {
+            sum_exp += std::exp(static_cast<double>(logits[v]) * inv_t - max_l);
+        }
+        const double lse = max_l + std::log(sum_exp);
+
+        const int k_top = std::clamp(req_logprobs > 0 ? req_logprobs : 1, 1, 64);
+        int32_t top_ids[64];
+        double top_vals[64];
+        for (int i = 0; i < k_top; ++i) { top_ids[i] = 0; top_vals[i] = -1e300; }
+        for (int v = 0; v < VOCAB_UNPADDED; ++v) {
+            const double lv = static_cast<double>(logits[v]) * inv_t;
+            if (lv > top_vals[k_top - 1]) {
+                int j = k_top - 1;
+                while (j > 0 && lv > top_vals[j - 1]) {
+                    top_vals[j] = top_vals[j - 1];
+                    top_ids[j] = top_ids[j - 1];
+                    --j;
+                }
+                top_vals[j] = lv;
+                top_ids[j] = v;
+            }
+        }
+        const int32_t best_tid = top_ids[0];
+        const double best_lp = top_vals[0] - lse;
+        const std::string_view best_text = tokenizer.decode_token_bytes(best_tid, false);
+
+        auto format_tok_key = [&](int32_t tid, char* buf, size_t cap) -> std::string_view {
+            if (return_tokens_as_token_ids) {
+                int n = std::snprintf(buf, cap, "token_id:%d", tid);
+                return (n > 0 && static_cast<size_t>(n) < cap) ? std::string_view(buf, static_cast<size_t>(n)) : std::string_view{};
+            }
+            return tokenizer.decode_token_bytes(tid, false);
+        };
+
+        ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+        bool ok = true;
+        ok = ok && bw.try_append_slice("{\"id\":");
+        ok = ok && bw.try_append_json_escaped(req_id);
+        ok = ok && bw.try_append_fmt(",\"object\":\"text_completion\",\"created\":%lld,\"model\":", static_cast<long long>(created));
+        ok = ok && bw.try_append_json_escaped(req_model);
+        ok = ok && bw.try_append_slice(",\"choices\":[{\"index\":0,\"text\":");
+        ok = ok && bw.try_append_json_escaped(best_text);
+        if (req_logprobs > 0) {
+            char tk_buf[32];
+            ok = ok && bw.try_append_slice(",\"logprobs\":{\"text_offset\":[0],\"token_logprobs\":[");
+            ok = ok && bw.try_append_fmt("%.10f", best_lp);
+            ok = ok && bw.try_append_slice("],\"tokens\":[");
+            ok = ok && bw.try_append_json_escaped(format_tok_key(best_tid, tk_buf, sizeof(tk_buf)));
+            ok = ok && bw.try_append_slice("],\"top_logprobs\":[{");
+            for (int i = 0; i < k_top && ok; ++i) {
+                if (i > 0) ok = ok && bw.try_append_byte(',');
+                ok = ok && bw.try_append_json_escaped(format_tok_key(top_ids[i], tk_buf, sizeof(tk_buf)));
+                ok = ok && bw.try_append_fmt(":%.10f", top_vals[i] - lse);
+            }
+            ok = ok && bw.try_append_slice("}]}");
+        } else {
+            ok = ok && bw.try_append_slice(",\"logprobs\":null");
+        }
+        ok = ok && bw.try_append_slice(",\"finish_reason\":");
+        ok = ok && bw.try_append_json_escaped((best_tid == EOS_TOKEN) ? "stop" : "length");
+        ok = ok && bw.try_append_fmt(
+            "}],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":1,\"total_tokens\":%u},"
+            "\"timings\":{\"prefill_ms\":%.2f,\"decode_ms\":0.00,\"tokens_per_second\":0.00}}",
+            stats.prompt_tokens, stats.prompt_tokens + 1u, stats.prefill_ms);
+        if (!ok) {
+            send_error_json(fd, 500, "Response exceeded 16 MiB static response buffer", "server_error", buffers.response_buf, kResponseBufferBytes);
+            return;
+        }
+        printf("[http] POST /v1/completions (logprobs=%d, bias=%zu) prompt=%u (cached=%u) prefill=%.1fms\n",
+               req_logprobs, logit_bias_count, stats.prompt_tokens, stats.cached_tokens, stats.prefill_ms);
+        std::fflush(stdout);
+        send_json_response(fd, 200, bw.slice());
+        return;
+    }
 
     if (!stream) {
         struct CmplCtx {
@@ -1638,9 +1803,536 @@ void handle_text_completions(
     (void)send_all(fd, "data: [DONE]\n\n");
 }
 
+void handle_tokenize(
+    int fd, std::string_view body, const Tokenizer& tokenizer,
+    const ServerConfig& config, ServerBuffers& buffers) {
+    size_t pos = 0;
+    skip_ws(body, pos);
+    if (pos >= body.size() || body[pos] != '{') {
+        send_error_json(fd, 400, "Invalid JSON body", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+        return;
+    }
+    ++pos;
+
+    std::string_view messages_json, tools_json, prompt_str;
+    bool has_prompt = false;
+    char effort_buf[32], key_buf[128];
+    std::string_view effort = config.default_effort;
+
+    for (uint32_t fiter = 0; pos < body.size() && fiter < 64; ++fiter) {
+        skip_ws(body, pos);
+        if (pos < body.size() && body[pos] == '}') break;
+        std::string_view k;
+        if (!parse_json_string(body, pos, key_buf, sizeof(key_buf), &k)) break;
+        skip_ws(body, pos);
+        if (pos >= body.size() || body[pos] != ':') break;
+        ++pos;
+        skip_ws(body, pos);
+
+        if (k == "messages") {
+            const size_t start = pos; skip_json_value(body, pos);
+            messages_json = body.substr(start, pos - start);
+        } else if (k == "tools") {
+            const size_t start = pos; skip_json_value(body, pos);
+            tools_json = body.substr(start, pos - start);
+        } else if (k == "prompt" || k == "content") {
+            if (pos < body.size() && body[pos] == '"') {
+                if (parse_json_string(body, pos, buffers.render_buf, kPromptRenderBytes, &prompt_str)) has_prompt = true;
+            } else {
+                skip_json_value(body, pos);
+            }
+        } else if (k == "chat_template_kwargs") {
+            const size_t start = pos; skip_json_value(body, pos);
+            const std::string_view kwargs_obj = body.substr(start, pos - start);
+            std::string_view eff_raw;
+            if (extract_raw_field(kwargs_obj, "reasoning_effort", &eff_raw)) {
+                if (!eff_raw.empty() && eff_raw[0] == '"') {
+                    size_t ep = 0;
+                    std::string_view es;
+                    if (parse_json_string(eff_raw, ep, effort_buf, sizeof(effort_buf), &es)) effort = es;
+                } else {
+                    const std::string_view rn = trim_ascii_ws(eff_raw);
+                    if (!rn.empty() && rn.size() <= sizeof(effort_buf) && rn != "null") {
+                        std::memcpy(effort_buf, rn.data(), rn.size());
+                        effort = std::string_view(effort_buf, rn.size());
+                    }
+                }
+            }
+        } else {
+            skip_json_value(body, pos);
+        }
+        skip_ws(body, pos);
+        if (pos < body.size() && body[pos] == ',') ++pos;
+    }
+
+    size_t tok_count = 0;
+    if (!messages_json.empty() && messages_json[0] == '[') {
+        RequestImages req_images{};
+        const ChatEncodeResult enc = encode_chat_template_zero_alloc(
+            tokenizer, messages_json, tools_json, effort, config.keep_history_thinking, true, buffers, req_images);
+        if (enc.overflow || enc.image_error) {
+            send_error_json(fd, 400, "Failed to tokenize messages", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+            return;
+        }
+        tok_count = enc.prompt_len;
+    } else if (has_prompt) {
+        tok_count = tokenizer.encode_into(prompt_str, true, buffers.tok_scratch, buffers.prompt_tokens, kPromptTokensMax);
+    } else {
+        send_error_json(fd, 400, "Missing 'prompt' or 'messages'", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+        return;
+    }
+
+    ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+    bool ok = bw.try_append_fmt("{\"count\":%zu,\"max_model_len\":%u,\"tokens\":[", tok_count, config.context_tokens_max);
+    for (size_t i = 0; i < tok_count && ok; ++i) {
+        if (i > 0) ok = ok && bw.try_append_byte(',');
+        ok = ok && bw.try_append_fmt("%d", buffers.prompt_tokens[i]);
+    }
+    ok = ok && bw.try_append_slice("]}");
+    if (!ok) {
+        send_error_json(fd, 500, "Tokenize response exceeded buffer", "server_error", buffers.response_buf, kResponseBufferBytes);
+        return;
+    }
+    send_json_response(fd, 200, bw.slice());
+}
+
+void handle_detokenize(
+    int fd, std::string_view body, const Tokenizer& tokenizer, ServerBuffers& buffers) {
+    size_t pos = 0;
+    skip_ws(body, pos);
+    if (pos >= body.size() || body[pos] != '{') {
+        send_error_json(fd, 400, "Invalid JSON body", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+        return;
+    }
+    ++pos;
+
+    size_t tok_count = 0;
+    bool has_tokens = false;
+    char key_buf[128];
+    for (uint32_t fiter = 0; pos < body.size() && fiter < 32; ++fiter) {
+        skip_ws(body, pos);
+        if (pos < body.size() && body[pos] == '}') break;
+        std::string_view k;
+        if (!parse_json_string(body, pos, key_buf, sizeof(key_buf), &k)) break;
+        skip_ws(body, pos);
+        if (pos >= body.size() || body[pos] != ':') break;
+        ++pos;
+        skip_ws(body, pos);
+
+        if (k == "tokens" && pos < body.size() && body[pos] == '[') {
+            ++pos;
+            has_tokens = true;
+            while (pos < body.size()) {
+                skip_ws(body, pos);
+                if (pos >= body.size()) break;
+                if (body[pos] == ']') { ++pos; break; }
+                int64_t tid = 0;
+                if (parse_json_i64_opt(body, pos, &tid) && tid >= 0 && tid < VOCAB_UNPADDED) {
+                    if (tok_count < kPromptTokensMax) buffers.prompt_tokens[tok_count++] = static_cast<int32_t>(tid);
+                }
+                skip_ws(body, pos);
+                if (pos < body.size() && body[pos] == ',') ++pos;
+            }
+        } else {
+            skip_json_value(body, pos);
+        }
+        skip_ws(body, pos);
+        if (pos < body.size() && body[pos] == ',') ++pos;
+    }
+
+    if (!has_tokens) {
+        send_error_json(fd, 400, "Missing 'tokens' array", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
+        return;
+    }
+
+    ByteWriter tw(buffers.render_buf, kPromptRenderBytes);
+    for (size_t i = 0; i < tok_count; ++i) {
+        const std::string_view piece = tokenizer.decode_token_bytes(buffers.prompt_tokens[i], false);
+        if (!tw.try_append_slice(piece)) {
+            send_error_json(fd, 500, "Detokenize output exceeded buffer", "server_error", buffers.response_buf, kResponseBufferBytes);
+            return;
+        }
+    }
+    ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+    bool ok = bw.try_append_slice("{\"prompt\":");
+    ok = ok && bw.try_append_json_escaped(tw.slice());
+    ok = ok && bw.try_append_slice(",\"content\":");
+    ok = ok && bw.try_append_json_escaped(tw.slice());
+    ok = ok && bw.try_append_byte('}');
+    if (!ok) {
+        send_error_json(fd, 500, "Detokenize response exceeded buffer", "server_error", buffers.response_buf, kResponseBufferBytes);
+        return;
+    }
+    send_json_response(fd, 200, bw.slice());
+}
+
+void sha256_hex(std::string_view data, char out_hex[65]) {
+    static constexpr uint32_t kK[64] = {
+        0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+        0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+        0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+        0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+        0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+        0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+        0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+        0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
+    };
+    uint32_t h[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+    auto rotr = [](uint32_t x, uint32_t n) -> uint32_t { return (x >> n) | (x << (32u - n)); };
+    auto compress = [&](const uint8_t blk[64]) {
+        uint32_t w[64];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = (static_cast<uint32_t>(blk[i * 4 + 0]) << 24) |
+                   (static_cast<uint32_t>(blk[i * 4 + 1]) << 16) |
+                   (static_cast<uint32_t>(blk[i * 4 + 2]) << 8)  |
+                   static_cast<uint32_t>(blk[i * 4 + 3]);
+        }
+        for (int i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+        for (int i = 0; i < 64; ++i) {
+            const uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch = (e & f) ^ ((~e) & g);
+            const uint32_t t1 = hh + S1 + ch + kK[i] + w[i];
+            const uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t t2 = S0 + maj;
+            hh = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+        h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    };
+
+    const auto* ptr = reinterpret_cast<const uint8_t*>(data.data());
+    const size_t len = data.size();
+    size_t off = 0;
+    while (len - off >= 64) {
+        compress(ptr + off);
+        off += 64;
+    }
+    uint8_t tail[128]{};
+    const size_t rem = len - off;
+    if (rem > 0) std::memcpy(tail, ptr + off, rem);
+    tail[rem] = 0x80u;
+    const size_t pad_len = (rem < 56) ? 64 : 128;
+    const uint64_t bit_len = static_cast<uint64_t>(len) * 8ULL;
+    for (int i = 0; i < 8; ++i) {
+        tail[pad_len - 8 + i] = static_cast<uint8_t>((bit_len >> (56 - i * 8)) & 0xFFu);
+    }
+    compress(tail);
+    if (pad_len == 128) compress(tail + 64);
+
+    static constexpr char kHex[] = "0123456789abcdef";
+    for (int i = 0; i < 8; ++i) {
+        for (int j = 0; j < 8; ++j) {
+            out_hex[i * 8 + j] = kHex[(h[i] >> (28 - j * 4)) & 0xFu];
+        }
+    }
+    out_hex[64] = '\0';
+}
+
+bool score_semif_row(
+    std::string_view row_obj,
+    Engine& engine,
+    const Tokenizer& tokenizer,
+    const ServerConfig& config,
+    ServerBuffers& buffers,
+    const int32_t slot_tids[16],
+    ByteWriter& out_bw,
+    const char** err_out) {
+    static constexpr std::string_view kDirectSystem =
+        "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. "
+        "Respond with only its uppercase letter, with no explanation or reasoning.";
+    static constexpr char kLetters[17] = "ABCDEFGHIJKLMNOP";
+
+    const uint64_t t_row_start = clock_monotonic_ns();
+    ByteWriter arena(buffers.content_buf, kContentBufferBytes);
+
+    auto alloc_str = [&](std::string_view src_raw, std::string_view* dst) -> bool {
+        if (src_raw.empty() || src_raw[0] != '"') return false;
+        size_t p = 0;
+        if (!parse_json_string(src_raw, p, arena.buffer + arena.length, arena.remaining(), dst)) return false;
+        arena.length += dst->size();
+        return true;
+    };
+
+    std::string_view id_raw, q_raw, state_raw, opts_raw;
+    if (!extract_raw_field(row_obj, "id", &id_raw) ||
+        !extract_raw_field(row_obj, "question", &q_raw) ||
+        !extract_raw_field(row_obj, "state", &state_raw) ||
+        !extract_raw_field(row_obj, "options", &opts_raw)) {
+        *err_out = "row needs id, state, question and options";
+        return false;
+    }
+
+    std::string_view row_id, question;
+    if (!alloc_str(id_raw, &row_id) || row_id.empty() || !alloc_str(q_raw, &question) || question.empty()) {
+        *err_out = "id and question must be nonempty strings";
+        return false;
+    }
+
+    state_raw = trim_ascii_ws(state_raw);
+    std::string_view state_str;
+    bool state_is_str = false;
+    if (!state_raw.empty() && state_raw[0] == '"') {
+        if (!alloc_str(state_raw, &state_str) || state_str.empty()) {
+            *err_out = "state must be a nonempty string, object, or array";
+            return false;
+        }
+        state_is_str = true;
+    } else if (!state_raw.empty() && (state_raw[0] == '{' || state_raw[0] == '[')) {
+        size_t sp = 1;
+        skip_ws(state_raw, sp);
+        const char close_ch = (state_raw[0] == '{') ? '}' : ']';
+        if (sp >= state_raw.size() || state_raw[sp] == close_ch) {
+            *err_out = "state must be a nonempty string, object, or array";
+            return false;
+        }
+    } else {
+        *err_out = "state must be a nonempty string, object, or array";
+        return false;
+    }
+
+    opts_raw = trim_ascii_ws(opts_raw);
+    if (opts_raw.empty() || opts_raw[0] != '[') {
+        *err_out = "options must contain 2-16 entries";
+        return false;
+    }
+
+    std::string_view opt_ids[16];
+    std::string_view opt_descs[16];
+    size_t n_opts = 0;
+    size_t op = 1;
+    while (op < opts_raw.size()) {
+        skip_ws(opts_raw, op);
+        if (op >= opts_raw.size() || opts_raw[op] == ']') break;
+        if (opts_raw[op] != '{' || n_opts >= 16) {
+            *err_out = "options must contain 2-16 entries";
+            return false;
+        }
+        const size_t ostart = op;
+        skip_json_value(opts_raw, op);
+        const std::string_view oobj = opts_raw.substr(ostart, op - ostart);
+        std::string_view oid_raw, odesc_raw;
+        if (!extract_raw_field(oobj, "id", &oid_raw) || !extract_raw_field(oobj, "description", &odesc_raw) ||
+            !alloc_str(oid_raw, &opt_ids[n_opts]) || !alloc_str(odesc_raw, &opt_descs[n_opts])) {
+            *err_out = "Each option needs string id and description fields";
+            return false;
+        }
+        for (size_t prev = 0; prev < n_opts; ++prev) {
+            if (opt_ids[prev] == opt_ids[n_opts]) {
+                *err_out = "Option IDs must be unique";
+                return false;
+            }
+        }
+        ++n_opts;
+        skip_ws(opts_raw, op);
+        if (op < opts_raw.size() && opts_raw[op] == ',') ++op;
+    }
+    if (n_opts < 2 || n_opts > 16) {
+        *err_out = "options must contain 2-16 entries";
+        return false;
+    }
+
+    // Render exact direct-options-v1 prompt into buffers.render_buf (matches semif_bridge.py byte-for-byte)
+    ByteWriter pw(buffers.render_buf, kPromptRenderBytes);
+    bool pok = true;
+    pok = pok && pw.try_append_slice("<|message_system|><|content_text|>");
+    pok = pok && pw.try_append_slice(kDirectSystem);
+    pok = pok && pw.try_append_slice("<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>");
+
+    // Payload JSON (matching Python json.dumps(payload, ensure_ascii=False))
+    ByteWriter payload_w(buffers.scratch_str_buf, kScratchStringBytes);
+    bool jok = true;
+    jok = jok && payload_w.try_append_slice("{\"evidence\": ");
+    if (state_is_str) {
+        jok = jok && payload_w.try_append_json_escaped(state_str);
+    } else {
+        jok = jok && payload_w.try_append_slice(state_raw);
+    }
+    jok = jok && payload_w.try_append_slice(", \"criterion\": ");
+    jok = jok && payload_w.try_append_json_escaped(question);
+    jok = jok && payload_w.try_append_slice(", \"options\": [");
+    for (size_t i = 0; i < n_opts && jok; ++i) {
+        if (i > 0) jok = jok && payload_w.try_append_slice(", ");
+        jok = jok && payload_w.try_append_slice("{\"letter\": \"");
+        jok = jok && payload_w.try_append_byte(kLetters[i]);
+        jok = jok && payload_w.try_append_slice("\", \"description\": ");
+        jok = jok && payload_w.try_append_json_escaped(opt_descs[i]);
+        jok = jok && payload_w.try_append_byte('}');
+    }
+    jok = jok && payload_w.try_append_slice("]}");
+
+    pok = pok && jok && pw.try_append_slice(payload_w.slice());
+    pok = pok && pw.try_append_slice("<|end_message|><|message_model|><|content_text|>");
+    if (!pok) {
+        *err_out = "Rendered SemIf prompt exceeded buffer";
+        return false;
+    }
+
+    const std::string_view prompt_sv = pw.slice();
+    char prompt_sha[65];
+    sha256_hex(prompt_sv, prompt_sha);
+
+    const size_t tok_count = tokenizer.encode_into(prompt_sv, true, buffers.tok_scratch, buffers.prompt_tokens, kPromptTokensMax);
+    const uint32_t max_toks = std::min(config.semif_max_tokens, config.context_tokens_max - 1u);
+    if (tok_count == 0 || tok_count > max_toks) {
+        *err_out = "Input tokens exceed semif max_prompt_tokens limit; no truncation allowed";
+        return false;
+    }
+    if (buffers.prompt_tokens[tok_count - 1] != tokenizer.id_text) {
+        *err_out = "Answer boundary does not end on content_text token";
+        return false;
+    }
+
+    const uint64_t t_fwd_start = clock_monotonic_ns();
+    engine.sample_params = {1.0f, 1.0f, 0, 1};
+    const GenerateStats stats = engine.generate_with_hint(
+        buffers.prompt_tokens, tok_count, 0, 1, 0, nullptr, 0, nullptr, nullptr, VisionInput{}, buffers.logits_buf);
+    const double forward_seconds = static_cast<double>(clock_monotonic_ns() - t_fwd_start) / 1e9;
+
+    const float* logits = buffers.logits_buf;
+    double max_l = -1e300;
+    for (size_t i = 0; i < n_opts; ++i) {
+        const double lv = static_cast<double>(logits[slot_tids[i]]);
+        if (!std::isfinite(lv)) {
+            *err_out = "Non-finite answer slot logit";
+            return false;
+        }
+        if (lv > max_l) max_l = lv;
+    }
+    double probs[16];
+    double sum_e = 0.0;
+    for (size_t i = 0; i < n_opts; ++i) {
+        probs[i] = std::exp(static_cast<double>(logits[slot_tids[i]]) - max_l);
+        sum_e += probs[i];
+    }
+    if (!std::isfinite(sum_e) || sum_e <= 0.0) {
+        *err_out = "answer slots carry no probability";
+        return false;
+    }
+    for (size_t i = 0; i < n_opts; ++i) probs[i] /= sum_e;
+    const double total_seconds = static_cast<double>(clock_monotonic_ns() - t_row_start) / 1e9;
+
+    bool ok = true;
+    ok = ok && out_bw.try_append_slice("{\"id\":");
+    ok = ok && out_bw.try_append_json_escaped(row_id);
+    ok = ok && out_bw.try_append_slice(",\"option_ids\":[");
+    for (size_t i = 0; i < n_opts && ok; ++i) {
+        if (i > 0) ok = ok && out_bw.try_append_byte(',');
+        ok = ok && out_bw.try_append_json_escaped(opt_ids[i]);
+    }
+    ok = ok && out_bw.try_append_slice("],\"probabilities\":[");
+    for (size_t i = 0; i < n_opts && ok; ++i) {
+        if (i > 0) ok = ok && out_bw.try_append_byte(',');
+        ok = ok && out_bw.try_append_fmt("%.17g", probs[i]);
+    }
+    ok = ok && out_bw.try_append_fmt(
+        "],\"input_tokens\":%zu,\"forward_seconds\":%.9f,\"total_seconds\":%.9f,\"prompt_sha256\":\"%s\","
+        "\"prompt_version\":\"direct-options-v1\",\"model\":{\"native_model\":\"Inkling-2-Mini\",\"backend\":\"squidDGX\",\"max_prompt_tokens\":%u},"
+        "\"readout\":\"squidDGX last-position probabilities restricted to declared answer slots\","
+        "\"probability_status\":\"conditional option score over quantized weights; uncalibrated as decision confidence\"}",
+        tok_count, forward_seconds, total_seconds, prompt_sha, config.semif_max_tokens);
+    if (!ok) {
+        *err_out = "Score response exceeded buffer";
+        return false;
+    }
+
+    printf("[http] POST /score id=%.*s prompt=%zu (cached=%u) fwd=%.1fms\n",
+           static_cast<int>(row_id.size()), row_id.data(), tok_count, stats.cached_tokens, forward_seconds * 1000.0);
+    std::fflush(stdout);
+    return true;
+}
+
+void handle_semif_score(
+    int fd, std::string_view body, Engine& engine, const Tokenizer& tokenizer,
+    const ServerConfig& config, ServerBuffers& buffers) {
+    static constexpr char kLetters[17] = "ABCDEFGHIJKLMNOP";
+    int32_t slot_tids[16]{};
+    for (int i = 0; i < 16; ++i) {
+        int32_t tmp[4];
+        const std::string_view letter(&kLetters[i], 1);
+        const size_t n = tokenizer.encode_into(letter, false, buffers.tok_scratch, tmp, 4);
+        if (n != 1 || tokenizer.decode_token_bytes(tmp[0], false) != letter) {
+            ByteWriter eb(buffers.response_buf, kResponseBufferBytes);
+            eb.append_slice("{\"error\":\"Answer slot letter is not a single exact round-trip token\"}");
+            send_json_response(fd, 500, eb.slice());
+            return;
+        }
+        slot_tids[i] = tmp[0];
+    }
+
+    size_t pos = 0;
+    skip_ws(body, pos);
+    if (pos >= body.size() || (body[pos] != '{' && body[pos] != '[')) {
+        ByteWriter eb(buffers.response_buf, kResponseBufferBytes);
+        eb.append_slice("{\"error\":\"ValueError: body must be a JSON object or array\"}");
+        send_json_response(fd, 400, eb.slice());
+        return;
+    }
+
+    ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+    const char* err = nullptr;
+
+    if (body[pos] == '{') {
+        const size_t rstart = pos;
+        skip_json_value(body, pos);
+        if (!score_semif_row(body.substr(rstart, pos - rstart), engine, tokenizer, config, buffers, slot_tids, bw, &err)) {
+            ByteWriter eb(buffers.response_buf, kResponseBufferBytes);
+            eb.append_slice("{\"error\":");
+            eb.append_json_escaped(err ? std::string_view(err) : std::string_view("Invalid score row"));
+            eb.append_byte('}');
+            send_json_response(fd, 400, eb.slice());
+            return;
+        }
+        send_json_response(fd, 200, bw.slice());
+        return;
+    }
+
+    ++pos;
+    bool ok = bw.try_append_byte('[');
+    size_t row_count = 0;
+    while (pos < body.size() && ok) {
+        skip_ws(body, pos);
+        if (pos >= body.size() || body[pos] == ']') break;
+        if (body[pos] != '{') {
+            err = "Each element in score batch must be a JSON object";
+            ok = false;
+            break;
+        }
+        const size_t rstart = pos;
+        skip_json_value(body, pos);
+        if (row_count > 0) ok = ok && bw.try_append_byte(',');
+        if (!ok || !score_semif_row(body.substr(rstart, pos - rstart), engine, tokenizer, config, buffers, slot_tids, bw, &err)) {
+            ok = false;
+            break;
+        }
+        ++row_count;
+        skip_ws(body, pos);
+        if (pos < body.size() && body[pos] == ',') ++pos;
+    }
+    ok = ok && bw.try_append_byte(']');
+    if (!ok) {
+        ByteWriter eb(buffers.response_buf, kResponseBufferBytes);
+        eb.append_slice("{\"error\":");
+        eb.append_json_escaped(err ? std::string_view(err) : std::string_view("Invalid score batch"));
+        eb.append_byte('}');
+        send_json_response(fd, 400, eb.slice());
+        return;
+    }
+    send_json_response(fd, 200, bw.slice());
+}
+
 void handle_connection(
     int fd, Engine& engine, const Tokenizer& tokenizer,
-    const ServerConfig& config, ServerBuffers& buffers, uint64_t& prng_state) {
+    const ServerConfig& config, ServerBuffers& buffers, uint64_t& prng_state, bool is_semif_port) {
     const HttpReadResult rr = read_http_request(fd, buffers.request_buf, kRequestBufferBytes);
     if (rr.status == HttpReadStatus::BadRequest) {
         send_error_json(fd, 400, rr.err_msg, "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
@@ -1664,6 +2356,23 @@ void handle_connection(
             "Access-Control-Allow-Headers: Authorization, Content-Type\r\n"
             "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
             "Content-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+
+    if (is_semif_port) {
+        if (req.method == "GET" && req.path == "/health") {
+            ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+            bw.append_fmt("{\"native_model\":\"Inkling-2-Mini\",\"backend\":\"squidDGX\",\"port\":%u}", config.semif_port);
+            send_json_response(fd, 200, bw.slice());
+            return;
+        }
+        if (req.method == "POST" && req.path == "/score") {
+            handle_semif_score(fd, req.body, engine, tokenizer, config, buffers);
+            return;
+        }
+        ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
+        bw.append_slice("{\"error\":\"not found\"}");
+        send_json_response(fd, 404, bw.slice());
         return;
     }
 
@@ -1708,6 +2417,21 @@ void handle_connection(
         return;
     }
 
+    if (req.method == "POST" && (req.path == "/tokenize" || req.path == "/v1/tokenize")) {
+        handle_tokenize(fd, req.body, tokenizer, config, buffers);
+        return;
+    }
+
+    if (req.method == "POST" && (req.path == "/detokenize" || req.path == "/v1/detokenize")) {
+        handle_detokenize(fd, req.body, tokenizer, buffers);
+        return;
+    }
+
+    if (req.method == "POST" && req.path == "/score") {
+        handle_semif_score(fd, req.body, engine, tokenizer, config, buffers);
+        return;
+    }
+
     send_error_json(fd, 404, "Unknown endpoint", "invalid_request_error", buffers.response_buf, kResponseBufferBytes);
 }
 
@@ -1738,44 +2462,54 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
-    int listen_fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        fprintf(stderr, "[server] Failed to create socket\n");
-        return 1;
-    }
+    auto bind_listener = [&](uint16_t bind_port) -> int {
+        int sfd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (sfd < 0) return -1;
+        int reuse = 1;
+        (void)::setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(bind_port);
+        addr.sin_addr.s_addr = INADDR_ANY;
+        if (config.host != "0.0.0.0") {
+            char host_z[128];
+            SQUID_ASSERT(config.host.size() < sizeof(host_z));
+            std::memcpy(host_z, config.host.data(), config.host.size());
+            host_z[config.host.size()] = '\0';
+            if (::inet_pton(AF_INET, host_z, &addr.sin_addr) != 1) {
+                fprintf(stderr, "[server] Invalid bind host '%.*s'\n", static_cast<int>(config.host.size()), config.host.data());
+                ::close(sfd);
+                return -1;
+            }
+        }
+        if (::bind(sfd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+            fprintf(stderr, "[server] Failed to bind %.*s:%u\n", static_cast<int>(config.host.size()), config.host.data(), bind_port);
+            ::close(sfd);
+            return -1;
+        }
+        if (::listen(sfd, 128) < 0) {
+            fprintf(stderr, "[server] Failed to listen on port %u\n", bind_port);
+            ::close(sfd);
+            return -1;
+        }
+        return sfd;
+    };
 
-    int reuse = 1;
-    (void)::setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    int listen_fd = bind_listener(config.port);
+    if (listen_fd < 0) return 1;
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(config.port);
-    addr.sin_addr.s_addr = INADDR_ANY;
-    if (config.host != "0.0.0.0") {
-        char host_z[128];
-        SQUID_ASSERT(config.host.size() < sizeof(host_z));
-        std::memcpy(host_z, config.host.data(), config.host.size());
-        host_z[config.host.size()] = '\0';
-        if (::inet_pton(AF_INET, host_z, &addr.sin_addr) != 1) {
-            fprintf(stderr, "[server] Invalid bind host '%.*s'\n", static_cast<int>(config.host.size()), config.host.data());
+    int semif_fd = -1;
+    if (config.semif_port > 0 && config.semif_port != config.port) {
+        semif_fd = bind_listener(config.semif_port);
+        if (semif_fd < 0) {
             ::close(listen_fd);
             return 1;
         }
     }
 
-    if (::bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-        fprintf(stderr, "[server] Failed to bind %.*s:%u\n", static_cast<int>(config.host.size()), config.host.data(), config.port);
-        ::close(listen_fd);
-        return 1;
-    }
-    if (::listen(listen_fd, 128) < 0) {
-        fprintf(stderr, "[server] Failed to listen\n");
-        ::close(listen_fd);
-        return 1;
-    }
-
     g_stop_requested.store(false, std::memory_order_release);
     g_listen_fd.store(listen_fd, std::memory_order_release);
+    g_semif_fd.store(semif_fd, std::memory_order_release);
     engine.enable_prefix_cache();
 
     ServerBuffers buffers{};
@@ -1788,6 +2522,10 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
            static_cast<int>(config.host.size()), config.host.data(), config.port,
            static_cast<int>(config.model_name.size()), config.model_name.data(),
            config.context_tokens_max, config.max_output_tokens, config.default_mtp);
+    if (semif_fd >= 0) {
+        printf("[server] SemIf decision endpoint listening natively on http://%.*s:%u/score (max_prompt_tokens=%u, no sidecar)\n",
+               static_cast<int>(config.host.size()), config.host.data(), config.semif_port, config.semif_max_tokens);
+    }
     std::fflush(stdout);
 
     timeval sock_timeout{};
@@ -1795,24 +2533,36 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
     sock_timeout.tv_usec = 0;
 
     while (!g_stop_requested.load(std::memory_order_acquire)) {
-        int client_fd = ::accept(listen_fd, nullptr, nullptr);
-        if (client_fd < 0) {
+        pollfd pfds[2]{};
+        nfds_t nfds = 0;
+        pfds[nfds++] = {listen_fd, POLLIN, 0};
+        if (semif_fd >= 0) pfds[nfds++] = {semif_fd, POLLIN, 0};
+
+        int ready = ::poll(pfds, nfds, -1);
+        if (ready < 0) {
             if (g_stop_requested.load(std::memory_order_acquire)) break;
             if (errno == EINTR) continue;
             continue;
         }
-        int nodelay = 1;
-        (void)::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-        (void)::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &sock_timeout, sizeof(sock_timeout));
-        (void)::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &sock_timeout, sizeof(sock_timeout));
+        for (nfds_t i = 0; i < nfds; ++i) {
+            if (!(pfds[i].revents & POLLIN)) continue;
+            int client_fd = ::accept(pfds[i].fd, nullptr, nullptr);
+            if (client_fd < 0) continue;
+            int nodelay = 1;
+            (void)::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+            (void)::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &sock_timeout, sizeof(sock_timeout));
+            (void)::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &sock_timeout, sizeof(sock_timeout));
 
-        handle_connection(client_fd, engine, tokenizer, config, buffers, prng_state);
-        ::close(client_fd);
+            handle_connection(client_fd, engine, tokenizer, config, buffers, prng_state, pfds[i].fd == semif_fd);
+            ::close(client_fd);
+        }
     }
 
     buffers.deinit();
     int rem_fd = g_listen_fd.exchange(-1, std::memory_order_acq_rel);
     if (rem_fd >= 0) ::close(rem_fd);
+    int rem_sfd = g_semif_fd.exchange(-1, std::memory_order_acq_rel);
+    if (rem_sfd >= 0) ::close(rem_sfd);
     printf("[server] Shutdown complete.\n");
     std::fflush(stdout);
     return 0;

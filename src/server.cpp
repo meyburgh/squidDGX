@@ -1340,6 +1340,66 @@ struct ToolCallConstraintCtx {
     }
 };
 
+// Degenerate-repetition guard. Watches generated tokens (gen[], written by the engine before
+// each callback) for an exact cycle: the last 2*P tokens repeating the P before them (three
+// copies, at least kMinSpan tokens) for some period P <= kMaxPeriod. In reasoning, and when
+// reasoning exceeds max_reasoning tokens, it asks the caller to end the reasoning block and let
+// the model answer; anywhere else it stops generation.
+struct LoopGuard {
+    enum Act : uint8_t { None, EndThinking, Stop };
+    static constexpr uint32_t kMaxPeriod = 256;
+    // Reasoning: three copies spanning >= 48 tokens. Answers and tool calls can repeat
+    // legitimately (tables, arrays), so there: four copies spanning >= 200 tokens.
+    static constexpr uint32_t kMinSpanThinking = 48;
+    static constexpr uint32_t kMinSpanText = 200;
+    bool enabled = true;
+    const int32_t* gen = nullptr;
+    uint32_t base = 0;          // index in gen[] of the first token this guard has seen
+    uint32_t n = 0;             // tokens seen since base
+    uint32_t run[kMaxPeriod + 1];
+    uint32_t reasoning_tokens = 0;
+    uint32_t max_reasoning = 0; // 0 = no cap
+    Act pending = None;
+    uint32_t cut = 0;           // gen[] index to keep up to (exclusive) when acting
+    uint32_t period = 0;
+    bool stopped = false;
+
+    void start(const int32_t* g, uint32_t at) {
+        gen = g;
+        base = at;
+        n = 0;
+        std::memset(run, 0, sizeof(run));
+        pending = None;
+    }
+
+    Act observe(InklingSection sec) {
+        if (!enabled) return None;
+        const uint32_t i = base + n;  // index of the token just generated
+        ++n;
+        if (sec == InklingSection::Thinking) ++reasoning_tokens;
+        const bool thinking = (sec == InklingSection::Thinking);
+        const uint32_t copies = thinking ? 2 : 3;  // repeats after the first copy
+        const uint32_t min_span = thinking ? kMinSpanThinking : kMinSpanText;
+        const uint32_t pmax = std::min<uint32_t>(kMaxPeriod, n - 1);
+        for (uint32_t p = 1; p <= pmax; ++p) {
+            run[p] = (gen[i] == gen[i - p]) ? run[p] + 1 : 0;
+            if (run[p] >= copies * p && run[p] + p >= min_span) {
+                period = p;
+                cut = i + 1 - run[p];  // keep the first copy, drop the repeats
+                pending = (sec == InklingSection::Thinking) ? EndThinking : Stop;
+                return pending;
+            }
+        }
+        if (max_reasoning > 0 && sec == InklingSection::Thinking && reasoning_tokens >= max_reasoning) {
+            period = 0;
+            cut = i + 1;
+            pending = EndThinking;
+            return pending;
+        }
+        return None;
+    }
+};
+
 // Returns the index of the <|content_invoke_tool_json|> token of the first tool call in
 // gen[0, n) whose arguments do not match the tool's schema, or -1 if all are valid (a call cut
 // off by max_tokens counts as valid: constraining it again would not finish it either).
@@ -1409,6 +1469,8 @@ void handle_chat_completions(
     bool include_usage = false;
     bool enable_thinking = true;
     std::string_view response_format_raw;
+    uint32_t max_reasoning_tokens = config.max_reasoning_tokens;
+    bool has_max_reasoning = false;
     int32_t req_mtp = static_cast<int32_t>(config.default_mtp);
     StopList stops{};
 
@@ -1479,6 +1541,11 @@ void handle_chat_completions(
                 et = trim_ascii_ws(et);
                 if (et == "false") enable_thinking = false;
                 else if (et == "true") enable_thinking = true;
+            }
+        } else if (k == "max_reasoning_tokens") {
+            if (parse_json_i64_opt(body, pos, &iv)) {
+                max_reasoning_tokens = static_cast<uint32_t>(std::clamp<int64_t>(iv, 0, INT32_MAX));
+                has_max_reasoning = true;
             }
         } else if (k == "response_format") {
             const size_t start = pos; skip_json_value(body, pos);
@@ -1587,6 +1654,14 @@ void handle_chat_completions(
     // Tool calls are generated freely (with speculative drafts); a call whose arguments miss
     // its schema is regenerated from its <|content_invoke_tool_json|> token with the schema
     // enforced (see repair_tool_call below).
+    // Default reasoning budget: the server's for low effort, four times that for medium and up.
+    if (!has_max_reasoning && !(effort == "none" || effort == "minimal" || effort == "low")) {
+        max_reasoning_tokens = static_cast<uint32_t>(std::min<uint64_t>(4ULL * max_reasoning_tokens, INT32_MAX));
+    }
+    LoopGuard loop_guard{};
+    loop_guard.enabled = config.loop_guard;
+    loop_guard.max_reasoning = max_reasoning_tokens;
+    loop_guard.start(buffers.gen_tokens, 0);
     const bool check_tool_calls = !json_constrained && config.constrain_tool_calls && tools_json.size() > 2 &&
                                   tool_schemas.build(tools_json, buffers.scratch_str_buf, kScratchStringBytes);
     // Returns false if no repair was needed or possible. `reset_ctx` re-syncs the caller's
@@ -1607,27 +1682,65 @@ void handle_chat_completions(
         for (uint32_t i = 0; i < keep; ++i) (void)parser.feed(buffers.gen_tokens[i]);
         reset_ctx();
         engine.constraint = {&ToolCallConstraintCtx::choose_cb, &tool_ctx, buffers.logits_buf};
+        loop_guard.start(buffers.gen_tokens, keep);
+        loop_guard.max_reasoning = 0;
         const GenerateStats s2 = engine.generate_with_hint(
             buffers.prompt_tokens, len2, enc.system_prefix_tokens, gen_limit - keep, 0,
             buffers.gen_tokens + keep, gen_limit - keep, cb, cb_ctx, vision_in);
         engine.constraint = {};
-        printf("[http] tool call arguments missed their schema; regenerated %u tokens from token %u (%u replaced)\n",
-               s2.generated_tokens, keep, tool_ctx.replaced);
+        if (loop_guard.pending != LoopGuard::None) { loop_guard.stopped = true; loop_guard.pending = LoopGuard::None; }
+        printf("[http] tool call arguments for '%.*s' missed their schema; regenerated %u tokens from token %u (%u replaced)\n",
+               static_cast<int>(tool_ctx.header_len), tool_ctx.header, s2.generated_tokens, keep, tool_ctx.replaced);
         stats.generated_tokens = keep + s2.generated_tokens;
         stats.last_token_id = s2.last_token_id;
         stats.decode_ms += s2.prefill_ms + s2.decode_ms;
         return true;
     };
 
+    // After the guard stopped generation: in reasoning, drop the repeats, close the reasoning
+    // block and let the model go on (at most twice); otherwise the generation ends as "length".
+    auto resolve_loops = [&](GenerateStats& stats, TokenCallbackFn cb, void* cb_ctx, auto&& reset_ctx) {
+        for (int round = 0; loop_guard.pending != LoopGuard::None; ++round) {
+            const LoopGuard::Act act = loop_guard.pending;
+            const uint32_t keep = loop_guard.cut;
+            printf("[http] %s: %s at token %u (period %u, reasoning %u tokens)\n",
+                   act == LoopGuard::EndThinking && round < 2 ? "closing reasoning" : "stopping",
+                   loop_guard.period > 0 ? "repetition loop" : "reasoning budget reached",
+                   keep, loop_guard.period, loop_guard.reasoning_tokens);
+            if (act != LoopGuard::EndThinking || round >= 2) { loop_guard.stopped = true; loop_guard.pending = LoopGuard::None; break; }
+            const uint32_t len2 = static_cast<uint32_t>(enc.prompt_len) + keep + 1;
+            if (keep + 1 >= gen_limit || len2 >= config.context_tokens_max || len2 >= kPromptTokensMax) {
+                loop_guard.stopped = true; loop_guard.pending = LoopGuard::None; break;
+            }
+            buffers.gen_tokens[keep] = tokenizer.id_end_message;
+            std::memcpy(buffers.prompt_tokens + enc.prompt_len, buffers.gen_tokens, static_cast<size_t>(keep + 1) * sizeof(int32_t));
+            parser.init(&tokenizer, config.raw_thinking, buffers, prng_state);
+            if (!enable_thinking) parser.section = InklingSection::Text;
+            for (uint32_t i = 0; i <= keep; ++i) (void)parser.feed(buffers.gen_tokens[i]);
+            reset_ctx();
+            loop_guard.start(buffers.gen_tokens, keep + 1);
+            loop_guard.reasoning_tokens = 0;
+            loop_guard.max_reasoning = (round == 0 && max_reasoning_tokens > 0) ? max_reasoning_tokens / 2 : max_reasoning_tokens;
+            const GenerateStats s2 = engine.generate_with_hint(
+                buffers.prompt_tokens, len2, enc.system_prefix_tokens, gen_limit - keep - 1, static_cast<uint32_t>(req_mtp),
+                buffers.gen_tokens + keep + 1, gen_limit - keep - 1, cb, cb_ctx, vision_in);
+            stats.generated_tokens = keep + 1 + s2.generated_tokens;
+            stats.last_token_id = s2.last_token_id;
+            stats.decode_ms += s2.prefill_ms + s2.decode_ms;
+        }
+    };
+
     if (!stream) {
         struct NonStreamCtx {
             InklingStreamParser* parser;
             const StopList* stops;
+            LoopGuard* guard;
             size_t scanned_len = 0;
             bool hit_stop = false;
             static bool on_token(void* p, int32_t tid) {
                 auto* self = static_cast<NonStreamCtx*>(p);
                 (void)self->parser->feed(tid);
+                if (self->guard->observe(self->parser->section) != LoopGuard::None) return false;
                 if (self->stops->count > 0) {
                     const std::string_view full = self->parser->content_writer.slice();
                     const size_t overlap = (self->stops->max_len > 1) ? (self->stops->max_len - 1) : 0;
@@ -1642,17 +1755,19 @@ void handle_chat_completions(
                 }
                 return true;
             }
-        } ctx{&parser, &stops};
+        } ctx{&parser, &stops, &loop_guard};
 
         GenerateStats stats = engine.generate_with_hint(
             buffers.prompt_tokens, enc.prompt_len, enc.system_prefix_tokens,
             gen_limit, static_cast<uint32_t>(req_mtp), buffers.gen_tokens, gen_limit, NonStreamCtx::on_token, &ctx, vision_in);
         if (!ctx.hit_stop) {
-            (void)repair_tool_call(stats, NonStreamCtx::on_token, &ctx, [&] { ctx.scanned_len = 0; });
+            resolve_loops(stats, NonStreamCtx::on_token, &ctx, [&] { ctx.scanned_len = 0; });
+            if (!loop_guard.stopped) (void)repair_tool_call(stats, NonStreamCtx::on_token, &ctx, [&] { ctx.scanned_len = 0; });
         }
 
         const bool hit_eos = (stats.last_token_id == EOS_TOKEN);
         const char* finish_reason = (parser.tool_call_count > 0) ? "tool_calls"
+                                  : loop_guard.stopped           ? "length"
                                   : (ctx.hit_stop || hit_eos)    ? "stop" : "length";
         const double dec_toks = static_cast<double>(stats.generated_tokens > 0 ? stats.generated_tokens - 1 : 0);
         const double tps = (stats.decode_ms > 0.0) ? (dec_toks * 1000.0 / stats.decode_ms) : 0.0;
@@ -1720,6 +1835,7 @@ void handle_chat_completions(
         ByteWriter frame_prefix;
         InklingStreamParser* parser;
         const StopList* stops;
+        LoopGuard* guard;
         size_t emitted_len = 0;
         size_t scanned_len = 0;
         bool hit_stop = false;
@@ -1728,6 +1844,7 @@ void handle_chat_completions(
         static bool on_token(void* p, int32_t tid) {
             auto* self = static_cast<StreamCtx*>(p);
             const auto delta = self->parser->feed(tid);
+            const bool loop_hit = self->guard->observe(self->parser->section) != LoopGuard::None;
             if (!delta.reasoning.empty()) {
                 if (!send_chat_sse_delta(self->fd, self->frame_prefix, DeltaKind::Reasoning, delta.reasoning, nullptr, nullptr)) {
                     self->conn_ok = false;
@@ -1768,9 +1885,9 @@ void handle_chat_completions(
                     self->emitted_len = self->parser->content_writer.length;
                 }
             }
-            return true;
+            return !loop_hit;
         }
-    } sctx{fd, frame_prefix, &parser, &stops};
+    } sctx{fd, frame_prefix, &parser, &stops, &loop_guard};
 
     GenerateStats stats = engine.generate_with_hint(
         buffers.prompt_tokens, enc.prompt_len, enc.system_prefix_tokens,
@@ -1778,10 +1895,13 @@ void handle_chat_completions(
     if (!sctx.conn_ok) return;
     if (!sctx.hit_stop) {
         // Text already streamed stays sent; the rebuilt parser resumes after it.
-        (void)repair_tool_call(stats, StreamCtx::on_token, &sctx, [&] {
+        auto resync = [&] {
             sctx.emitted_len = std::min(sctx.emitted_len, parser.content_writer.length);
             sctx.scanned_len = std::min(sctx.scanned_len, parser.content_writer.length);
-        });
+        };
+        resolve_loops(stats, StreamCtx::on_token, &sctx, resync);
+        if (!sctx.conn_ok) return;
+        if (!loop_guard.stopped) (void)repair_tool_call(stats, StreamCtx::on_token, &sctx, resync);
         if (!sctx.conn_ok) return;
     }
 
@@ -1795,6 +1915,7 @@ void handle_chat_completions(
 
     const bool hit_eos = (stats.last_token_id == EOS_TOKEN);
     const char* finish_reason = (parser.tool_call_count > 0) ? "tool_calls"
+                              : loop_guard.stopped           ? "length"
                               : (sctx.hit_stop || hit_eos)   ? "stop" : "length";
     (void)send_chat_sse_delta(fd, frame_prefix, DeltaKind::Empty, "", finish_reason, include_usage ? &stats : nullptr);
     (void)send_all(fd, "data: [DONE]\n\n");

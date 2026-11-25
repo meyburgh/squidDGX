@@ -15,6 +15,8 @@ struct ServerConfig {
     uint16_t semif_port = 8897;
     uint32_t semif_max_tokens = 16384;
     std::string_view model_name = "inkling-2-mini";
+    // Weights-specific identity reported as model.weights_id on the SemIf endpoint (see compute_weights_id).
+    std::string_view weights_id = "Inkling-2-Mini@unknown";
     std::string_view api_key = "";
     std::string_view default_effort = "none";
     uint32_t default_mtp = MTP_MAX_DRAFTS;
@@ -26,6 +28,14 @@ struct ServerConfig {
     bool raw_thinking = false;
     bool keep_history_thinking = false;
 };
+
+// Builds a weights identity that changes iff the served weights change:
+//   "Inkling-2-Mini.sha256x64m-<16hex>.<mode>[.abl-sha256x64m-<16hex>]"  (chars limited to [A-Za-z0-9.-])
+// sha256x64m = SHA-256 over the concatenated hex SHA-256 digests of consecutive 64 MiB chunks
+// of the file (parallel, so startup stays at disk speed). Mode is the weight quantization
+// (nvfp4|fp8|exact), which changes the effective weights. Returns false on I/O failure.
+bool compute_weights_id(std::string_view model_directory, std::string_view ablation_path,
+                        std::string_view mode, char* out, size_t out_cap);
 
 int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerConfig& config);
 

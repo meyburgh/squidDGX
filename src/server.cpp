@@ -3,6 +3,9 @@
 #include "tiger.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -16,6 +19,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
+#include <vector>
 
 namespace squid {
 
@@ -2236,10 +2241,11 @@ bool score_semif_row(
     }
     ok = ok && out_bw.try_append_fmt(
         "],\"input_tokens\":%zu,\"forward_seconds\":%.9f,\"total_seconds\":%.9f,\"prompt_sha256\":\"%s\","
-        "\"prompt_version\":\"direct-options-v1\",\"model\":{\"native_model\":\"Inkling-2-Mini\",\"backend\":\"squidDGX\",\"max_prompt_tokens\":%u},"
+        "\"prompt_version\":\"direct-options-v1\",\"model\":{\"native_model\":\"Inkling-2-Mini\",\"weights_id\":\"%.*s\",\"backend\":\"squidDGX\",\"max_prompt_tokens\":%u},"
         "\"readout\":\"squidDGX last-position probabilities restricted to declared answer slots\","
         "\"probability_status\":\"conditional option score over quantized weights; uncalibrated as decision confidence\"}",
-        tok_count, forward_seconds, total_seconds, prompt_sha, config.semif_max_tokens);
+        tok_count, forward_seconds, total_seconds, prompt_sha,
+        static_cast<int>(config.weights_id.size()), config.weights_id.data(), config.semif_max_tokens);
     if (!ok) {
         *err_out = "Score response exceeded buffer";
         return false;
@@ -2362,7 +2368,10 @@ void handle_connection(
     if (is_semif_port) {
         if (req.method == "GET" && req.path == "/health") {
             ByteWriter bw(buffers.response_buf, kResponseBufferBytes);
-            bw.append_fmt("{\"native_model\":\"Inkling-2-Mini\",\"backend\":\"squidDGX\",\"port\":%u}", config.semif_port);
+            bw.append_fmt("{\"native_model\":\"Inkling-2-Mini\",\"weights_id\":\"%.*s\",\"backend\":\"squidDGX\",\"port\":%u,"
+                          "\"prompt_version\":\"direct-options-v1\",\"model\":{\"native_model\":\"Inkling-2-Mini\",\"weights_id\":\"%.*s\",\"backend\":\"squidDGX\"}}",
+                          static_cast<int>(config.weights_id.size()), config.weights_id.data(), config.semif_port,
+                          static_cast<int>(config.weights_id.size()), config.weights_id.data());
             send_json_response(fd, 200, bw.slice());
             return;
         }
@@ -2436,6 +2445,63 @@ void handle_connection(
 }
 
 } // namespace
+
+namespace {
+
+bool file_fingerprint_hex(const char* path_z, char out_hex[65]) {
+    const int fd = ::open(path_z, O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || st.st_size <= 0) { ::close(fd); return false; }
+    const size_t bytes = static_cast<size_t>(st.st_size);
+    void* map = ::mmap(nullptr, bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (map == MAP_FAILED) return false;
+    ::madvise(map, bytes, MADV_SEQUENTIAL);
+    const char* base = static_cast<const char*>(map);
+
+    constexpr size_t kChunk = 64ull << 20;
+    const size_t n_chunks = (bytes + kChunk - 1) / kChunk;
+    std::vector<char> digests(n_chunks * 64);
+    std::atomic<size_t> next{0};
+    const unsigned n_threads = std::max(1u, std::min<unsigned>(std::thread::hardware_concurrency(), 16u));
+    std::vector<std::thread> workers;
+    workers.reserve(n_threads);
+    for (unsigned t = 0; t < n_threads; ++t) {
+        workers.emplace_back([&] {
+            char hex[65];
+            for (size_t i = next.fetch_add(1); i < n_chunks; i = next.fetch_add(1)) {
+                const size_t off = i * kChunk;
+                sha256_hex(std::string_view(base + off, std::min(kChunk, bytes - off)), hex);
+                std::memcpy(digests.data() + i * 64, hex, 64);
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    ::munmap(map, bytes);
+    sha256_hex(std::string_view(digests.data(), digests.size()), out_hex);
+    return true;
+}
+
+} // namespace
+
+bool compute_weights_id(std::string_view model_directory, std::string_view ablation_path,
+                        std::string_view mode, char* out, size_t out_cap) {
+    char path_buf[4096];
+    char main_hex[65];
+    if (!file_fingerprint_hex(format_path_z(path_buf, sizeof(path_buf), model_directory, "/model-00001-of-00001.safetensors"), main_hex))
+        return false;
+    int n = std::snprintf(out, out_cap, "Inkling-2-Mini.sha256x64m-%.16s.%.*s", main_hex,
+                          static_cast<int>(mode.size()), mode.data());
+    if (n < 0 || static_cast<size_t>(n) >= out_cap) return false;
+    if (!ablation_path.empty()) {
+        char abl_hex[65];
+        if (!file_fingerprint_hex(format_path_z(path_buf, sizeof(path_buf), ablation_path, ""), abl_hex)) return false;
+        const int m = std::snprintf(out + n, out_cap - static_cast<size_t>(n), ".abl-sha256x64m-%.16s", abl_hex);
+        if (m < 0 || static_cast<size_t>(n + m) >= out_cap) return false;
+    }
+    return true;
+}
 
 size_t valid_utf8_prefix_len(std::string_view s) {
     const size_t n = s.size();

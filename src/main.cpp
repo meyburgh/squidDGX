@@ -400,6 +400,19 @@ int main(int argc, char** argv) {
         scfg.max_output_tokens = std::min(std::max(max_tokens, 1u), ctx);
         scfg.raw_thinking = raw_thinking;
         scfg.keep_history_thinking = keep_history_thinking;
+        static char weights_id_buf[256];
+        {
+            const uint64_t t0 = squid::clock_monotonic_ns();
+            const std::string_view canon_mode = (quant_mode == squid::QuantMode::NVFP4) ? "nvfp4"
+                                              : (quant_mode == squid::QuantMode::FP8)   ? "fp8" : "exact";
+            if (squid::compute_weights_id(model_directory, ablation_path, canon_mode, weights_id_buf, sizeof(weights_id_buf))) {
+                scfg.weights_id = weights_id_buf;
+                printf("[server] weights_id=%s (%.1fs)\n", weights_id_buf, (squid::clock_monotonic_ns() - t0) / 1e9);
+            } else {
+                fprintf(stderr, "[server] WARNING: failed to fingerprint weights; weights_id=%.*s\n",
+                        static_cast<int>(scfg.weights_id.size()), scfg.weights_id.data());
+            }
+        }
         exit_code = squid::run_openai_server(engine, tokenizer, scfg);
     } else if (command == "logits") {
         if (out_path.empty() || prompt_len < 2 || out_path.size() >= 1024) {

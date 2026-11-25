@@ -325,11 +325,13 @@ struct Compiler {
         return idx;
     }
 
-    void resolve_refs() {
-        for (auto& n : sch.nodes) {
+    // Resolves $ref in nodes [first, end); "#" means `doc_root` (the schema document's root).
+    void resolve_refs(size_t first, int32_t doc_root) {
+        for (size_t ni = first; ni < sch.nodes.size(); ++ni) {
+            JsonSchemaNode& n = sch.nodes[ni];
             if (n.ref_path.empty()) continue;
-            const std::string& r = n.ref_path;
-            if (r == "#") { n.ref = sch.root; continue; }
+            const std::string r = n.ref_path;
+            if (r == "#") { n.ref = doc_root; continue; }
             int32_t target = kJsAnyNode;
             for (const char* key : {"$defs", "definitions"}) {
                 const std::string prefix = std::string("#/") + key + "/";
@@ -416,8 +418,74 @@ bool JsonSchema::compile(std::string_view schema_json, std::string* err) {
     root = kJsAnyNode;
     if (v.t == JVal::Obj) c.collect_defs(v);
     root = c.compile(v, 0);
-    c.resolve_refs();
+    c.resolve_refs(0, root);
     return true;
+}
+
+void JsonSchema::init_empty() {
+    nodes.clear();
+    nodes.emplace_back();  // 0: any
+    root = kJsAnyNode;
+}
+
+int32_t JsonSchema::add_tool(std::string_view name, std::string_view parameters_json) {
+    const size_t first = nodes.size();
+    int32_t params = kJsAnyNode;
+    JParser jp{parameters_json};
+    JVal v;
+    if (!parameters_json.empty() && jp.val(v, 0) && v.t == JVal::Obj) {
+        Compiler c{*this, {}};
+        c.collect_defs(v);
+        params = c.compile(v, 0);
+        c.resolve_refs(first, params);
+        // Tool parameters are always an object, even when the schema leaves "type" out.
+        JsonSchemaNode& pn = nodes[static_cast<size_t>(resolve(params))];
+        if (pn.alts.empty() && pn.literals.empty() && (pn.types & kJsObj)) pn.types = kJsObj;
+    } else {
+        nodes.emplace_back();
+        params = static_cast<int32_t>(nodes.size() - 1);
+        nodes[static_cast<size_t>(params)].types = kJsObj;
+    }
+    nodes.emplace_back();
+    const int32_t name_node = static_cast<int32_t>(nodes.size() - 1);
+    nodes[static_cast<size_t>(name_node)].types = kJsStr;
+    nodes[static_cast<size_t>(name_node)].literals.push_back(encode_json_string(name));
+
+    nodes.emplace_back();
+    const int32_t entry = static_cast<int32_t>(nodes.size() - 1);
+    JsonSchemaNode& e = nodes[static_cast<size_t>(entry)];
+    e.types = kJsObj;
+    e.additional = kJsForbidden;
+    for (const char* k : {"name", "args"}) {
+        std::string enc = encode_json_string(k);
+        e.prop_hash.push_back(json_key_hash(std::string_view(enc).substr(1, enc.size() - 2)));
+        e.prop_keys.push_back(std::move(enc));
+    }
+    e.prop_schema = {name_node, params};
+    e.required = 3;
+    return entry;
+}
+
+void JsonSchema::finish_tools(const std::vector<std::string>& names) {
+    nodes.emplace_back();
+    const int32_t name_node = static_cast<int32_t>(nodes.size() - 1);
+    nodes[static_cast<size_t>(name_node)].types = kJsStr;
+    for (const auto& nm : names) nodes[static_cast<size_t>(name_node)].literals.push_back(encode_json_string(nm));
+    nodes.emplace_back();
+    const int32_t args_node = static_cast<int32_t>(nodes.size() - 1);
+    nodes[static_cast<size_t>(args_node)].types = kJsObj;
+    nodes.emplace_back();
+    root = static_cast<int32_t>(nodes.size() - 1);
+    JsonSchemaNode& e = nodes[static_cast<size_t>(root)];
+    e.types = kJsObj;
+    e.additional = kJsForbidden;
+    for (const char* k : {"name", "args"}) {
+        std::string enc = encode_json_string(k);
+        e.prop_hash.push_back(json_key_hash(std::string_view(enc).substr(1, enc.size() - 2)));
+        e.prop_keys.push_back(std::move(enc));
+    }
+    e.prop_schema = {name_node, args_node};
+    e.required = 3;
 }
 
 int32_t JsonSchema::resolve(int32_t idx) const {
@@ -450,7 +518,9 @@ JsonMatcher& JsonMatcher::operator=(const JsonMatcher& o) {
     return *this;
 }
 
-void JsonMatcher::init(const JsonSchema* schema) {
+void JsonMatcher::init(const JsonSchema* schema) { init(schema, schema->root); }
+
+void JsonMatcher::init(const JsonSchema* schema, int32_t root) {
     schema_ = schema;
     started_ = false;
     n_ = 1;
@@ -460,7 +530,7 @@ void JsonMatcher::init(const JsonSchema* schema) {
     s.done = false;
     std::memset(&s.f[0], 0, sizeof(Frame));
     s.f[0].kind = kValue;
-    s.f[0].node = schema->root;
+    s.f[0].node = root;
 }
 
 void JsonMatcher::feed(const Stack& in, uint8_t c, Stack* out, int& n_out, int guard) const {

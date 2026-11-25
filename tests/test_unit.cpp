@@ -108,6 +108,31 @@ static void test_json_constraint() {
     SQUID_ASSERT(m.accepts("me\":") && !m.accepts("x"));
     SQUID_ASSERT(m.advance("me\":\""));
     SQUID_ASSERT(!s.compile("{not json", &err));
+
+    // Tool calls: {"name": <tool>, "args": <its parameters>}.
+    squid::JsonSchema ts;
+    ts.init_empty();
+    const int32_t ask = ts.add_tool("ask_user_question", R"({"type":"object","additionalProperties":false,"required":["questions"],
+      "properties":{"questions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["id","text","multi_select"],
+      "properties":{"id":{"type":"string"},"text":{"type":"string"},"multi_select":{"type":"boolean"}}}}}})");
+    const int32_t get = ts.add_tool("get_dashboard", R"({"properties":{"id":{"type":"string"}},"required":["id"]})");
+    ts.finish_tools({"ask_user_question", "get_dashboard"});
+    squid::JsonMatcher tm;
+    tm.init(&ts, ask);
+    SQUID_ASSERT(tm.advance(R"({"name":"ask_user_question","args":{"questions":[{"id":"q1","text":"Which?","multi_select":false}]}})") && tm.can_end());
+    tm.init(&ts, ask);
+    SQUID_ASSERT(tm.advance(R"({"name":"ask_user_question","args":{"questions":[{"text":"Which?")"));
+    SQUID_ASSERT(!tm.accepts("}"));                       // id and multi_select still required
+    tm.init(&ts, ask);
+    SQUID_ASSERT(!tm.advance(R"({"name":"get_dashboard")"));  // header said ask_user_question
+    tm.init(&ts, get);
+    SQUID_ASSERT(tm.advance(R"({"args":{"id":"d-1"},"name":"get_dashboard"})") && tm.can_end());
+    tm.init(&ts, get);
+    SQUID_ASSERT(!tm.advance(R"({"name":"get_dashboard","args":[)"));  // args is always an object
+    tm.init(&ts);                                          // unknown header: any tool name, any args
+    SQUID_ASSERT(tm.advance(R"({"name":"get_dashboard","args":{"x":1}})") && tm.can_end());
+    tm.init(&ts);
+    SQUID_ASSERT(!tm.advance(R"({"name":"nope")"));
     SQUID_ASSERT(!s.compile("\"{bad\"", &err));
     SQUID_ASSERT(!json_doc(any, " {}", &end));                                   // no leading whitespace
     SQUID_ASSERT(json_doc(any, "{\r\n  \"a\": 1\n}", &end) && end);           // pretty-printed

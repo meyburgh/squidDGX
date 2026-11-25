@@ -51,6 +51,14 @@ struct JsonSchema {
     // json_schema: returns false (with err) if the schema text is not valid JSON.
     bool compile(std::string_view schema_json, std::string* err);
 
+    // Tool calls: start empty and add one entry per tool; each entry matches
+    // {"name": <that name>, "args": <its parameters>}. finish_tools() sets the root to a fallback
+    // used when the caller cannot tell which tool is being called: the name must be one of the
+    // tools and args any object (a union over many tools would branch the matcher per tool).
+    void init_empty();
+    int32_t add_tool(std::string_view name, std::string_view parameters_json);  // returns the entry node
+    void finish_tools(const std::vector<std::string>& names);
+
     int32_t resolve(int32_t idx) const;
 };
 
@@ -87,6 +95,7 @@ public:
     JsonMatcher& operator=(const JsonMatcher& o);  // copies only the live stacks and frames
 
     void init(const JsonSchema* schema);
+    void init(const JsonSchema* schema, int32_t root);
     bool advance(std::string_view bytes);              // false => rejected (state unchanged)
     bool accepts(std::string_view bytes) const;
     bool can_end() const;                              // the bytes so far form a complete document

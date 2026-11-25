@@ -14,7 +14,8 @@ struct ServerConfig {
     uint16_t port = 8000;
     uint16_t semif_port = 8897;
     uint32_t semif_max_tokens = 16384;
-    uint32_t prefix_sessions = 3;   // conversations parked in host RAM besides the live one
+    uint32_t prefix_sessions = 3;
+    bool constrain_tool_calls = true;  // grammar-constrain tool-call arguments to the tool schemas   // conversations parked in host RAM besides the live one
     std::string_view model_name = "inkling-2-mini";
     // Weights-specific identity reported as model.weights_id on the SemIf endpoint (see compute_weights_id).
     std::string_view weights_id = "Inkling-2-Mini@unknown";

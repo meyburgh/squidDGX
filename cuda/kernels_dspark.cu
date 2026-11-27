@@ -18,8 +18,9 @@ __global__ void dspark_mix_kernel(
     const __nv_bfloat16* __restrict__ n3,
     float* __restrict__ out_mix,          // [3, B, HIDDEN] (when out_mix_h == nullptr)
     __half* __restrict__ out_mix_h,       // [3, B, HIDDEN] (when NVFP4/FP8 linear_h used)
-    float* __restrict__ f_ring,           // [16, HIDDEN]
-    const int32_t* __restrict__ d_pos) {
+    float* __restrict__ f_ring,           // [16, HIDDEN] (or [MAX_DSPARK_SLOTS*16, HIDDEN])
+    const int32_t* __restrict__ d_pos,
+    const BatchTokenMeta* __restrict__ tok_meta) {
     int b = blockIdx.x;
     int m = blockIdx.y; // 0..3
     int tid = threadIdx.x;
@@ -55,8 +56,12 @@ __global__ void dspark_mix_kernel(
     const __nv_bfloat16* nw = (m == 0) ? n0 : (m == 1 ? n1 : (m == 2 ? n2 : n3));
     float s = inv_rms;
     if (m == 3) {
-        float* dst = f_ring + (size_t)(((*d_pos) + b) & 15) * HIDDEN;
-        for (int d = tid; d < HIDDEN; d += 256) dst[d] = buf[d] * s * __bfloat162float(nw[d]);
+        int slot_id = tok_meta ? tok_meta[b].slot_id : 0;
+        int pos = tok_meta ? tok_meta[b].pos : ((*d_pos) + b);
+        if (slot_id < MAX_DSPARK_SLOTS) {
+            float* dst = f_ring + ((size_t)slot_id * SCONV_RING_SLOTS + (size_t)(pos & 15)) * HIDDEN;
+            for (int d = tid; d < HIDDEN; d += 256) dst[d] = buf[d] * s * __bfloat162float(nw[d]);
+        }
     } else if (out_mix_h != nullptr) {
         __half* dst_h = out_mix_h + ((size_t)m * B + b) * HIDDEN;
         for (int d = tid; d < HIDDEN; d += 256) dst_h[d] = __float2half(buf[d] * s * __bfloat162float(nw[d]));
@@ -77,12 +82,23 @@ __global__ void dspark_store_ctx_kv_kernel(
     __half* __restrict__ k_scale,
     __half* __restrict__ v_scale,
     int cap,
-    const int32_t* __restrict__ d_pos) {
+    bool is_local,
+    const int32_t* __restrict__ d_pos,
+    const BatchTokenMeta* __restrict__ tok_meta,
+    const int32_t* __restrict__ ds_page_table) {
     int b = blockIdx.x;
     int h = blockIdx.y; // 0..7
     int tid = threadIdx.x; // 0..127 (full head_dim!)
-    int pos = (*d_pos) + b;
-    int slot = pos % cap;
+    int slot_id = tok_meta ? tok_meta[b].slot_id : 0;
+    if (slot_id >= MAX_DSPARK_SLOTS) return;
+    int pos = tok_meta ? tok_meta[b].pos : ((*d_pos) + b);
+    int slot;
+    if (is_local) {
+        slot = slot_id * cap + (pos % cap);
+    } else {
+        const int32_t* pt = ds_page_table ? (ds_page_table + (size_t)slot_id * MAX_KV_PAGES) : nullptr;
+        slot = kv_phys_slot(pt, pos, cap);
+    }
 
     const float* kp = kv + (size_t)b * (2 * KV_DIM) + h * HEAD_DIM;
     const float* vp = kv + (size_t)b * (2 * KV_DIM) + KV_DIM + h * HEAD_DIM;
@@ -248,7 +264,8 @@ dspark_attn_bulk_splitk_kernel(
     const __half* __restrict__ cvs,
     int cap, int window,
     const int32_t* __restrict__ d_pos,
-    float* __restrict__ split_buf) {
+    float* __restrict__ split_buf,
+    const int32_t* __restrict__ page_table) {
     int p = *d_pos;
     if (p <= 0) return;
 
@@ -268,7 +285,7 @@ dspark_attn_bulk_splitk_kernel(
 
     constexpr int QKV_STRIDE = Q_DIM + 2 * KV_DIM;
     run_tc_bulk_splitk<KV_FMT, 24, QKV_STRIDE, 128>(
-        qkv, ck, cv, cks, cvs, cap, blockIdx.x, split, t_start, t_end, split_buf);
+        qkv, ck, cv, cks, cvs, cap, blockIdx.x, split, t_start, t_end, split_buf, page_table);
 }
 
 // DSpark Block Attention writing __half directly for w_o linear_h!
@@ -983,13 +1000,14 @@ void launch_dspark_commit(
     __half* ctx_ks[MTP_LAYERS], __half* ctx_vs[MTP_LAYERS],
     int ctx_cap[MTP_LAYERS], KVFormat global_kv_fmt,
     float* f_ring, float* scratch_mix, float* scratch_kv,
-    int B, const int32_t* d_pos, cudaStream_t stream) {
+    int B, const int32_t* d_pos, cudaStream_t stream,
+    const BatchTokenMeta* tok_meta, const int32_t* ds_page_table) {
     const bool use_half = (dw.layers[0].w_kv_ctx.kind != WeightKind::BF16);
     __half* mix_h_base = use_half ? reinterpret_cast<__half*>(scratch_mix) : nullptr;
     dspark_mix_kernel<<<dim3(B, 4), 256, 0, stream>>>(
         taps, B, dw.fuse_alpha,
         dw.layers[0].dflare_norm, dw.layers[1].dflare_norm, dw.layers[2].dflare_norm,
-        dw.markov_dflare_norm, scratch_mix, mix_h_base, f_ring, d_pos);
+        dw.markov_dflare_norm, scratch_mix, mix_h_base, f_ring, d_pos, tok_meta);
     for (int l = 0; l < MTP_LAYERS; ++l) {
         if (use_half) {
             const __half* mix_lh = mix_h_base + (size_t)l * B * HIDDEN;
@@ -998,16 +1016,18 @@ void launch_dspark_commit(
             const float* mix_l = scratch_mix + (size_t)l * B * HIDDEN;
             launch_linear(dw.layers[l].w_kv_ctx, mix_l, scratch_kv, B, false, stream);
         }
-        KVFormat lfmt = dw.layers[l].is_local ? KVFormat::BF16 : global_kv_fmt;
+        const bool is_loc = dw.layers[l].is_local;
+        KVFormat lfmt = is_loc ? KVFormat::BF16 : global_kv_fmt;
+        const int32_t* pt = is_loc ? nullptr : ds_page_table;
         if (lfmt == KVFormat::FP8) {
             dspark_store_ctx_kv_kernel<1><<<dim3(B, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
-                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos);
+                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], is_loc, d_pos, tok_meta, pt);
         } else if (lfmt == KVFormat::Q4) {
             dspark_store_ctx_kv_kernel<2><<<dim3(B, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
-                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos);
+                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], is_loc, d_pos, tok_meta, pt);
         } else {
             dspark_store_ctx_kv_kernel<0><<<dim3(B, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
-                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], d_pos);
+                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], is_loc, d_pos, tok_meta, pt);
         }
     }
 }
@@ -1019,7 +1039,7 @@ void launch_dspark_draft(
     int ctx_cap[MTP_LAYERS], KVFormat global_kv_fmt, float* split_buf,
     const float* f_ring, float* ws, int32_t* out_draft_tokens, float* out_draft_conf, float threshold,
     const SampleConfig* sample_cfg, float* out_draft_probs, float* out_draft_q_sel,
-    int32_t* out_draft_is_delta, cudaStream_t stream) {
+    int32_t* out_draft_is_delta, cudaStream_t stream, const int32_t* ds_page_table) {
     const DsparkWeights& dw = mw.dspark;
 
     // Partition preallocated DSpark workspace (in floats):
@@ -1064,18 +1084,18 @@ void launch_dspark_draft(
         if (dl.is_local) {
             dim3 sgrid(NUM_KV_HEADS, DSPARK_LOCAL_SPLITS);
             dspark_attn_bulk_splitk_kernel<0, DSPARK_LOCAL_SPLITS><<<sgrid, 128, 0, stream>>>(
-                qkv, ctx_k[l], ctx_v[l], nullptr, nullptr, ctx_cap[l], SWA_WINDOW, d_pos, split_buf);
+                qkv, ctx_k[l], ctx_v[l], nullptr, nullptr, ctx_cap[l], SWA_WINDOW, d_pos, split_buf, nullptr);
         } else {
             dim3 sgrid(NUM_KV_HEADS, KV_SPLIT_K);
             if (global_kv_fmt == KVFormat::FP8) {
                 dspark_attn_bulk_splitk_kernel<1, KV_SPLIT_K><<<sgrid, 128, 0, stream>>>(
-                    qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], 0, d_pos, split_buf);
+                    qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], 0, d_pos, split_buf, ds_page_table);
             } else if (global_kv_fmt == KVFormat::Q4) {
                 dspark_attn_bulk_splitk_kernel<2, KV_SPLIT_K><<<sgrid, 128, 0, stream>>>(
-                    qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], 0, d_pos, split_buf);
+                    qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], 0, d_pos, split_buf, ds_page_table);
             } else {
                 dspark_attn_bulk_splitk_kernel<0, KV_SPLIT_K><<<sgrid, 128, 0, stream>>>(
-                    qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], 0, d_pos, split_buf);
+                    qkv, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], ctx_cap[l], 0, d_pos, split_buf, ds_page_table);
             }
         }
         dspark_block_attn_kernel<<<dim3(NUM_HEADS, MTP_BLOCK_SIZE), 256, 0, stream>>>(
@@ -1162,6 +1182,160 @@ void launch_dspark_draft(
             out_draft_tokens + i, out_draft_conf,
             dp_i, out_draft_q_sel ? (out_draft_q_sel + i) : nullptr, out_draft_is_delta,
             sample_cfg, d_pos, i, Vd, threshold);
+    }
+}
+
+void launch_dspark_draft_batched(
+    const ModelWeights& mw,
+    const DsparkSlotDraftDesc* slots,
+    int n_slots,
+    const __half* ctx_ks[MTP_LAYERS],
+    const __half* ctx_vs[MTP_LAYERS],
+    int ctx_cap[MTP_LAYERS],
+    KVFormat global_kv_fmt,
+    float* split_buf,
+    float* ws,
+    int32_t* out_draft_is_delta,
+    cudaStream_t stream) {
+    const DsparkWeights& dw = mw.dspark;
+    const int tot_rows = n_slots * MTP_BLOCK_SIZE; // 16, 24, or 32
+    int total_drafts = 0;
+    int draft_off[MAX_DSPARK_SLOTS]{};
+    for (int di = 0; di < n_slots; ++di) {
+        draft_off[di] = total_drafts;
+        total_drafts += slots[di].num_drafts;
+    }
+
+    // Partition expanded DSpark workspace for up to 4 concurrent 8-row blocks (32 rows total):
+    float* block_x      = ws;
+    __half* normed_h    = reinterpret_cast<__half*>(block_x + tot_rows * HIDDEN);
+    float* qkv          = reinterpret_cast<float*>(normed_h + tot_rows * HIDDEN);
+    __half* attn_out_h  = reinterpret_cast<__half*>(qkv + tot_rows * (Q_DIM + 2 * KV_DIM));
+    float* gu           = reinterpret_cast<float*>(attn_out_h + tot_rows * Q_DIM);
+    __half* swiglu_h    = reinterpret_cast<__half*>(gu + tot_rows * (2 * MTP_INTERMEDIATE));
+    float* final_norm   = reinterpret_cast<float*>(swiglu_h + tot_rows * MTP_INTERMEDIATE);
+    __half* final_norm_h = reinterpret_cast<__half*>(final_norm + total_drafts * HIDDEN);
+    float* f_prev       = reinterpret_cast<float*>(final_norm_h + ((total_drafts * HIDDEN + 1) & ~1));
+    float* c_f          = f_prev + HIDDEN;
+    float* c_h          = c_f + 3 * MTP_MARKOV_RANK;
+    float* state        = c_h + MTP_MAX_DRAFTS * (3 * MTP_MARKOV_RANK);
+    float* raw_rnn      = state + MTP_MARKOV_RANK;
+    float* blk_val      = raw_rnn + 3 * MTP_MARKOV_RANK;
+    int32_t* blk_idx    = reinterpret_cast<int32_t*>(blk_val + MARKOV_BLOCKS);
+    float* blk_cm       = reinterpret_cast<float*>(blk_idx + MARKOV_BLOCKS);
+    float* blk_csum     = blk_cm + MARKOV_BLOCKS;
+    __half* base_logits_h = reinterpret_cast<__half*>(blk_csum + MARKOV_BLOCKS);
+
+    constexpr int QKV_STRIDE = Q_DIM + 2 * KV_DIM;
+
+    // 1. Build 8-row block [anchor, mask x7] for each slot
+    for (int di = 0; di < n_slots; ++di) {
+        dspark_init_block_kernel<<<MTP_BLOCK_SIZE, 256, 0, stream>>>(
+            mw.embed, mw.embed_norm, dw.mask_embed, slots[di].d_anchor_token,
+            block_x + (size_t)di * MTP_BLOCK_SIZE * HIDDEN);
+    }
+
+    // 2. Run 3 DSpark layers loading EVERY NVFP4 layer weight ONCE across all n_slots!
+    for (int l = 0; l < MTP_LAYERS; ++l) {
+        const DsparkLayerWeights& dl = dw.layers[l];
+        dspark_rmsnorm_h_kernel<<<tot_rows, 256, 0, stream>>>(block_x, dl.input_norm, nullptr, normed_h);
+        launch_linear_h(dl.w_qkv, normed_h, qkv, tot_rows, false, stream);
+
+        for (int di = 0; di < n_slots; ++di) {
+            float* qkv_d = qkv + (size_t)di * MTP_BLOCK_SIZE * QKV_STRIDE;
+            __half* ao_d = attn_out_h + (size_t)di * MTP_BLOCK_SIZE * Q_DIM;
+            dspark_block_qk_rope_kernel<<<dim3(MTP_BLOCK_SIZE, NUM_HEADS + NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
+                qkv_d, dl.q_norm, dl.k_norm, slots[di].d_pos);
+            if (dl.is_local) {
+                dim3 sgrid(NUM_KV_HEADS, DSPARK_LOCAL_SPLITS);
+                dspark_attn_bulk_splitk_kernel<0, DSPARK_LOCAL_SPLITS><<<sgrid, 128, 0, stream>>>(
+                    qkv_d, slots[di].ctx_k[l], slots[di].ctx_v[l], nullptr, nullptr,
+                    ctx_cap[l], SWA_WINDOW, slots[di].d_pos, split_buf, nullptr);
+            } else {
+                dim3 sgrid(NUM_KV_HEADS, KV_SPLIT_K);
+                if (global_kv_fmt == KVFormat::FP8) {
+                    dspark_attn_bulk_splitk_kernel<1, KV_SPLIT_K><<<sgrid, 128, 0, stream>>>(
+                        qkv_d, slots[di].ctx_k[l], slots[di].ctx_v[l], ctx_ks[l], ctx_vs[l],
+                        ctx_cap[l], 0, slots[di].d_pos, split_buf, slots[di].ds_page_table);
+                } else if (global_kv_fmt == KVFormat::Q4) {
+                    dspark_attn_bulk_splitk_kernel<2, KV_SPLIT_K><<<sgrid, 128, 0, stream>>>(
+                        qkv_d, slots[di].ctx_k[l], slots[di].ctx_v[l], ctx_ks[l], ctx_vs[l],
+                        ctx_cap[l], 0, slots[di].d_pos, split_buf, slots[di].ds_page_table);
+                } else {
+                    dspark_attn_bulk_splitk_kernel<0, KV_SPLIT_K><<<sgrid, 128, 0, stream>>>(
+                        qkv_d, slots[di].ctx_k[l], slots[di].ctx_v[l], ctx_ks[l], ctx_vs[l],
+                        ctx_cap[l], 0, slots[di].d_pos, split_buf, slots[di].ds_page_table);
+                }
+            }
+            dspark_block_attn_kernel<<<dim3(NUM_HEADS, MTP_BLOCK_SIZE), 256, 0, stream>>>(
+                qkv_d, split_buf, ctx_cap[l], dl.is_local ? SWA_WINDOW : 0, slots[di].d_pos,
+                nullptr, ao_d);
+        }
+
+        launch_linear_h(dl.w_o, attn_out_h, block_x, tot_rows, true, stream);
+        dspark_rmsnorm_h_kernel<<<tot_rows, 256, 0, stream>>>(block_x, dl.post_norm, nullptr, normed_h);
+        launch_linear_h(dl.w_gu, normed_h, gu, tot_rows, false, stream);
+        dspark_swiglu_kernel<<<(tot_rows * MTP_INTERMEDIATE + 255) / 256, 256, 0, stream>>>(
+            gu, nullptr, swiglu_h, tot_rows);
+        launch_linear_h(dl.w_down, swiglu_h, block_x, tot_rows, true, stream);
+    }
+
+    // 3. Final norm for all drafting rows packed contiguously [0..total_drafts-1]
+    for (int di = 0; di < n_slots; ++di) {
+        dspark_rmsnorm_h_kernel<<<slots[di].num_drafts, 256, 0, stream>>>(
+            block_x + ((size_t)di * MTP_BLOCK_SIZE + 1) * HIDDEN,
+            dw.norm_w,
+            final_norm + (size_t)draft_off[di] * HIDDEN,
+            final_norm_h + (size_t)draft_off[di] * HIDDEN);
+    }
+
+    // 4. ONE SINGLE unembed_draft pass (259 MB NVFP4 loaded ONCE for all slots!)
+    const int Vd = dw.draft_vocab_size;
+    const auto* wd = static_cast<const uint8_t*>(dw.unembed_draft.data);
+    const auto* ws_sc = dw.unembed_draft.scales;
+    const float gs = dw.unembed_draft.global_scale;
+    switch (total_drafts) {
+        case 2: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<2>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, final_norm_h, dw.fold_b, base_logits_h, Vd, 0u); break;
+        case 3: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<3>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, final_norm_h, dw.fold_b, base_logits_h, Vd, 0u); break;
+        case 4: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<4>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, final_norm_h, dw.fold_b, base_logits_h, Vd, 0u); break;
+        case 5: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<5>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, final_norm_h, dw.fold_b, base_logits_h, Vd, 0u); break;
+        case 6: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<6>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, final_norm_h, dw.fold_b, base_logits_h, Vd, 0u); break;
+        case 7: launch_pdl(dspark_base_logits_nvfp4_mma_kernel<7>, dim3(DSPARK_UNEMBED_BLOCKS), 192, stream, wd, ws_sc, gs, final_norm_h, dw.fold_b, base_logits_h, Vd, 0u); break;
+    }
+
+    // 5. Run Markov RNN + fold argmax/sample per slot using precomputed base_logits_h
+    launch_bf16_linear(dw.rnn_w_h, final_norm, c_h, total_drafts, 3 * MTP_MARKOV_RANK, HIDDEN, stream);
+    for (int di = 0; di < n_slots; ++di) {
+        const auto& sl = slots[di];
+        copy_f_prev_zero_state_kernel<<<(HIDDEN + 255) / 256, 256, 0, stream>>>(sl.f_ring, sl.d_pos, f_prev, state);
+        launch_bf16_linear(dw.rnn_w_f, f_prev, c_f, 1, 3 * MTP_MARKOV_RANK, HIDDEN, stream);
+        for (int i = 0; i < sl.num_drafts; ++i) {
+            const int g_idx = draft_off[di] + i;
+            const int32_t* prev_ptr = (i == 0) ? sl.d_anchor_token : (sl.out_draft_tokens + i - 1);
+            markov_rnn_proj_kernel<<<24, 128, 0, stream>>>(
+                dw.rnn_w_sp, dw.rnn_bias, dw.markov_w1,
+                c_h + g_idx * (3 * MTP_MARKOV_RANK), c_f, prev_ptr, state, raw_rnn,
+                nullptr, 0.0f, i);
+            const void* bl_i = static_cast<const void*>(base_logits_h + (size_t)g_idx * Vd);
+            float* dp_i = sl.out_draft_probs ? (sl.out_draft_probs + (size_t)i * Vd) : nullptr;
+            if (dw.fold_w.kind == WeightKind::NVFP4) {
+                markov_fold_argmax_stage1_kernel<2><<<MARKOV_BLOCKS, 256, 0, stream>>>(
+                    dw.fold_w.data, dw.fold_w.scales, dw.fold_w.global_scale,
+                    bl_i, true, nullptr, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
+                    dp_i, sl.sample_cfg, Vd, nullptr, 0.0f, i);
+            } else {
+                markov_fold_argmax_stage1_kernel<0><<<MARKOV_BLOCKS, 256, 0, stream>>>(
+                    dw.fold_w.data, nullptr, 1.0f,
+                    bl_i, true, nullptr, raw_rnn, state, blk_val, blk_idx, blk_cm, blk_csum,
+                    dp_i, sl.sample_cfg, Vd, nullptr, 0.0f, i);
+            }
+            markov_fold_argmax_stage2_kernel<<<1, 256, 0, stream>>>(
+                blk_val, blk_idx, blk_cm, blk_csum, dw.draft_vocab_ids,
+                sl.out_draft_tokens + i, nullptr,
+                dp_i, sl.out_draft_q_sel ? (sl.out_draft_q_sel + i) : nullptr,
+                (di == 0) ? out_draft_is_delta : nullptr,
+                sl.sample_cfg, sl.d_pos, i, Vd, 0.0f);
+        }
     }
 }
 

@@ -324,6 +324,14 @@ __device__ __forceinline__ void ldmatrix_x2_trans(
 // Split-K attention partial buffer offsets are defined in config.hpp (single source of truth).
 constexpr size_t SPLIT_BUF_FLOATS = SPLIT_BUFFER_FLOATS;
 
+// Translate logical token index `t` to physical KV slot index.
+// When `page_table == nullptr`, uses contiguous modular indexing `t % kv_cap`.
+__device__ __forceinline__ int kv_phys_slot(
+    const int32_t* __restrict__ page_table, int t, int kv_cap) {
+    if (!page_table) return t % kv_cap;
+    return (page_table[t >> KV_PAGE_SHIFT] << KV_PAGE_SHIFT) | (t & KV_PAGE_MASK);
+}
+
 // Store one 128-dim KV head using 128 threads (tid = 0..127, 4 warps, caller provides sm[4]).
 // KV_FMT: 0 = BF16, 1 = FP8 (E4M3 + per-head half scale), 2 = Q4 ([-7..7]+7 + group-64 half scale).
 template <int KV_FMT>
@@ -442,7 +450,10 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
     const __half* __restrict__ v_scale,
     int kv_cap,
     int kvh, int split_slot, int t_start, int t_end,
-    float* __restrict__ split_buf) {
+    float* __restrict__ split_buf,
+    const int32_t* __restrict__ page_table = nullptr,
+    int b_out_off = 0,
+    int q_cnt_rt = Q_CNT) {
     constexpr int NM = (Q_CNT > 16) ? 2 : 1;
     int tid = threadIdx.x;
     int warp = tid >> 5;
@@ -457,9 +468,9 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
     float* s_o_out = split_buf + SPLIT_O_OFF;
 
     if (t_start >= t_end) {
-        if (tid < Q_CNT) {
+        if (tid < q_cnt_rt) {
             int gqa = tid % GQA_RATIO;
-            int b = tid / GQA_RATIO;
+            int b = b_out_off + tid / GQA_RATIO;
             int h = kvh * GQA_RATIO + gqa;
             int idx = (h * 8 + b) * KV_TOTAL_SPLITS + split_slot;
             s_m_out[idx] = -1e30f;
@@ -472,14 +483,14 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
     int q1 = m_tile * 16 + grp + 8;
     const float* qp0 = nullptr;
     const float* qp1 = nullptr;
-    if (q0 < Q_CNT) {
+    if (q0 < q_cnt_rt) {
         int h0 = kvh * GQA_RATIO + (q0 % GQA_RATIO);
-        int b0 = q0 / GQA_RATIO;
+        int b0 = b_out_off + q0 / GQA_RATIO;
         qp0 = q_base_ptr + (size_t)b0 * Q_STRIDE + h0 * HEAD_DIM;
     }
-    if (q1 < Q_CNT) {
+    if (q1 < q_cnt_rt) {
         int h1 = kvh * GQA_RATIO + (q1 % GQA_RATIO);
-        int b1 = q1 / GQA_RATIO;
+        int b1 = b_out_off + q1 / GQA_RATIO;
         qp1 = q_base_ptr + (size_t)b1 * Q_STRIDE + h1 * HEAD_DIM;
     }
 
@@ -549,7 +560,7 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
             int t_loc = idx >> 4;
             int sub = idx & 15;
             if (t_loc < tile_len) {
-                int slot = (t0 + t_loc) % kv_cap;
+                int slot = kv_phys_slot(page_table, t0 + t_loc, kv_cap);
                 *reinterpret_cast<uint4*>(&smem.kv.s_k[t_loc][sub * 8]) =
                     load_kv_8elems_h2x4<KV_FMT>(k_cache, k_scale, slot, kvh, sub);
                 *reinterpret_cast<uint4*>(&smem.kv.s_v[t_loc][sub * 8]) =
@@ -669,9 +680,9 @@ __device__ __forceinline__ void run_tc_bulk_splitk(
             int qi = i >> 7;
             int dim = i & 127;
             int q_glob = mt * 16 + qi;
-            if (q_glob < Q_CNT) {
+            if (q_glob < q_cnt_rt) {
                 int gqa = q_glob % GQA_RATIO;
-                int b = q_glob / GQA_RATIO;
+                int b = b_out_off + q_glob / GQA_RATIO;
                 int h = kvh * GQA_RATIO + gqa;
                 int idx = (h * 8 + b) * KV_TOTAL_SPLITS + split_slot;
                 float gm = fmaxf(smem.red.m[qi][0], smem.red.m[qi][1]);

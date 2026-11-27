@@ -147,6 +147,111 @@ struct DecodeResult {
     int32_t verify_width;
 };
 
+struct MtpRampPolicy {
+    // Draft count per active sequence at concurrency C = 1..MAX_BATCH_SLOTS.
+    // Tuned by autoresearch to maximize aggregate throughput while preserving C=1 speed.
+    uint32_t drafts_by_c[MAX_BATCH_SLOTS + 1] = {0, 7, 1, 1, 1, 0, 0, 0, 0};
+    uint32_t prefill_chunk_tokens = 1024;
+    bool commit_dspark_in_batch = true;
+};
+
+struct KVPagePool {
+    uint32_t total_pages = 0;
+    uint32_t free_count = 0;
+    int32_t free_stack[MAX_KV_PAGES]{};
+    int32_t slot_pages[MAX_BATCH_SLOTS][MAX_KV_PAGES]{};
+    uint32_t slot_num_pages[MAX_BATCH_SLOTS]{};
+
+    void init(uint32_t total_tokens) {
+        total_pages = std::min<uint32_t>(total_tokens / static_cast<uint32_t>(KV_PAGE_SIZE),
+                                         static_cast<uint32_t>(MAX_KV_PAGES));
+        reset_all();
+    }
+
+    void reset_all() {
+        free_count = total_pages;
+        for (uint32_t i = 0; i < total_pages; ++i) {
+            free_stack[i] = static_cast<int32_t>(total_pages - 1 - i);
+        }
+        for (int s = 0; s < MAX_BATCH_SLOTS; ++s) slot_num_pages[s] = 0;
+    }
+
+    uint32_t needed_pages_for(uint32_t tokens) const {
+        return (tokens + static_cast<uint32_t>(KV_PAGE_SIZE) - 1u) / static_cast<uint32_t>(KV_PAGE_SIZE);
+    }
+
+    bool can_fit(int slot, uint32_t needed_tokens) const {
+        const uint32_t np = needed_pages_for(needed_tokens);
+        if (np > static_cast<uint32_t>(MAX_KV_PAGES)) return false;
+        if (np <= slot_num_pages[slot]) return true;
+        return (np - slot_num_pages[slot]) <= free_count;
+    }
+
+    void release_slot(int slot) {
+        while (slot_num_pages[slot] > 0) {
+            free_stack[free_count++] = slot_pages[slot][--slot_num_pages[slot]];
+        }
+    }
+};
+
+struct BatchSlotStepIn {
+    int32_t slot_id = 0;
+    int32_t pos = 0;
+    int32_t anchor = 0;
+    uint32_t drafts_k = 0;
+    bool use_mtp = false;
+    SampleParams sample{};
+};
+
+struct BatchSlotStepOut {
+    int32_t tokens[MTP_BLOCK_SIZE]{};
+    uint32_t count = 0;
+    uint32_t drafts = 0;
+    uint32_t accepted = 0;
+};
+
+struct SingleAdaptiveStepOut {
+    int32_t tokens[MTP_BLOCK_SIZE]{};
+    uint32_t count = 0;
+    uint32_t drafts = 0;
+    uint32_t accepted = 0;
+    bool used_lookup = false;
+};
+
+struct BatchStepHostIO {
+    int32_t tokens[MTP_BLOCK_SIZE];
+    int32_t draft_tokens[MTP_BLOCK_SIZE];
+    int32_t next_tokens[MTP_BLOCK_SIZE];
+    BatchTokenMeta tok_meta[MTP_BLOCK_SIZE];
+    BatchSeqMeta seq_meta[MAX_BATCH_SLOTS];
+    SampleConfig sample_cfgs[MAX_BATCH_SLOTS];
+    int32_t slot_pos[MAX_BATCH_SLOTS];
+    int32_t slot_anchor[MAX_BATCH_SLOTS];
+};
+
+struct PrefillSlotChunk {
+    int slot_id = 0;
+    const int32_t* prompt_tokens = nullptr;
+    uint32_t start_pos = 0;
+    uint32_t chunk_len = 0;
+    bool is_final = false;
+    bool use_mtp = false;
+    SampleParams sample{};
+};
+
+constexpr size_t BATCH_GRAPH_CACHE_MAX = 128;
+struct BatchGraphEntry {
+    bool valid = false;
+    int32_t B = 0;
+    int32_t num_seqs = 0;
+    int32_t w_bucket = 0;
+    int32_t ctx_bucket = 2;
+    bool commit_dspark = false;
+    bool is_verify = false;
+    uint64_t draft_sig = 0;
+    cudaGraphExec_t exec = nullptr;
+};
+
 struct LocalStateCheckpoint {
     uint32_t pos = 0;
     bool valid = false;
@@ -187,10 +292,14 @@ struct PrefixCache {
 struct Engine {
     const LoadedModel* model = nullptr;
     uint32_t context_tokens_max = 0;
+    uint32_t max_batch_slots = 1;
+    uint32_t max_dspark_slots = 1;
     bool use_graphs = true;
     KVFormat kv_format = KVFormat::BF16;
     int32_t current_position = 0;
     VisitInfo schedule[NUM_VISITS]{};
+    KVPagePool kv_pool{};
+    bool identity_page_table_ready = false;
 
     VRAMArena arena{};
     cudaStream_t stream = nullptr;
@@ -209,12 +318,24 @@ struct Engine {
     float spec_threshold = 0.75f;
     bool use_prompt_lookup = true;
     cudaGraphExec_t prefill_b8_graph_exec[2]{};
+    BatchGraphEntry batch_graphs[BATCH_GRAPH_CACHE_MAX]{};
 
     // Pinned coherent decode results & lookup draft staging
     DecodeResult* h_decode_result = nullptr;
     DecodeResult* d_decode_result = nullptr;
     LookupDraft* h_lookup_draft = nullptr;
     LookupDraft* d_lookup_draft = nullptr;
+    BatchStepHostIO* h_batch_io = nullptr;
+
+    // Continuous batching device metadata
+    int32_t* d_page_table = nullptr;          // [MAX_BATCH_SLOTS * MAX_KV_PAGES]
+    BatchTokenMeta* d_tok_meta = nullptr;     // [MTP_BLOCK_SIZE]
+    BatchSeqMeta* d_seq_meta = nullptr;       // [MAX_BATCH_SLOTS]
+    SampleConfig* d_sample_cfgs = nullptr;    // [MAX_BATCH_SLOTS]
+    int32_t* d_slot_pos = nullptr;            // [MAX_BATCH_SLOTS]
+    int32_t* d_slot_anchor = nullptr;         // [MAX_BATCH_SLOTS]
+    int32_t* d_slot_drafts = nullptr;         // [MAX_DSPARK_SLOTS * MTP_MAX_DRAFTS]
+    int32_t* d_batch_draft_tokens = nullptr;  // [MTP_BLOCK_SIZE]
 
     PrefixCache prefix_cache{};
     PromptLookupIndex prompt_lookup{};
@@ -333,10 +454,43 @@ struct Engine {
     int32_t* d_vis_dst = nullptr;
     int32_t* d_vis_src = nullptr;
 
-    bool init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFormat kv_fmt);
+    bool init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFormat kv_fmt, uint32_t batch_slots = 1);
     void deinit();
     void reset();
     void enable_prefix_cache(uint32_t parked_sessions = 3);
+
+    // Continuous batching & Paged KV API
+    void ensure_identity_page_table_slot0();
+    void reset_slot(int slot_id);
+    bool ensure_slot_kv(int slot_id, uint32_t needed_tokens);
+    void release_slot_kv(int slot_id);
+    int32_t prefill_slot_chunk(
+        int slot_id,
+        const int32_t* prompt_tokens,
+        uint32_t start_pos,
+        uint32_t chunk_len,
+        bool is_final,
+        bool use_mtp,
+        const SampleParams& sp,
+        float* out_first_logits = nullptr);
+    void prefill_multi_slot_chunk(
+        const PrefillSlotChunk* chunks,
+        int num_chunks,
+        int32_t* out_first_tokens);
+    SingleAdaptiveStepOut step_single_adaptive_slot0(
+        int32_t pos,
+        int32_t anchor,
+        uint32_t max_rem,
+        const SampleParams& sp,
+        PromptLookupIndex* lookup,
+        bool* draft_in_flight,
+        bool* sample_cfg_uploaded);
+    void sync_stream_for_batch();
+    void step_batch_decode(
+        const BatchSlotStepIn* slots,
+        int num_seqs,
+        bool commit_dspark_when_k0,
+        BatchSlotStepOut* out);
 
     // Encode preprocessed images into a newly cudaMalloc'd GPU FP32 buffer [total_tokens, HIDDEN].
     // Caller must free with cudaFree(). Returns nullptr if vision weights are unavailable or empty.
@@ -384,7 +538,12 @@ private:
     uint32_t prefill_range(const int32_t* prompt, uint32_t start_i, uint32_t end_i, bool use_mtp, bool compute_last_lm);
     uint32_t prefill_final_range(const int32_t* prompt, uint32_t start_i, uint32_t prompt_len, bool use_mtp);
     void prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint32_t chunk_len, bool commit_dspark);
+    void prefill_chunk_batched_slot(int slot_id, const int32_t* prompt, uint32_t start_pos, uint32_t chunk_len, bool commit_dspark);
     void record_target_forward(int32_t batch_size, bool commit_dspark, bool compute_lm_head, bool is_verify, const int32_t* host_tokens = nullptr);
+    void record_batched_target_forward(int32_t batch_size, int32_t num_seqs, int32_t max_seq_width, bool commit_dspark, bool compute_lm_head, bool is_verify, int32_t ctx_bucket = 2);
+    cudaGraphExec_t get_or_capture_batch_graph(
+        int32_t batch_size, int32_t num_seqs, int32_t max_seq_width, bool commit_dspark, bool is_verify,
+        int32_t ctx_bucket = 2, uint64_t draft_sig = 0, const BatchSlotStepIn* spec_slots = nullptr);
 
     void ensure_b1_graph();
     void ensure_prefill_b8_graph(bool commit_dspark);

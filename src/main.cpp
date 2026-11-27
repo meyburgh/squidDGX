@@ -28,7 +28,7 @@ void print_usage() {
     static constexpr std::string_view kUsage =
         "squidDGX — C++20 + Blackwell CUDA Inference Engine & OpenAI Server for Inkling-2-Mini\n\n"
         "Usage:\n"
-        "  squidDGX serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv bf16|auto|fp8|q4] [--ctx 262144] [--max-tokens 65536] [--mtp 7] [--spec-threshold 0.75] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--prefix-sessions 3] [--no-tool-constraint] [--max-reasoning-tokens 8192] [--no-loop-guard] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n"
+        "  squidDGX serve    <model_dir> [--host 0.0.0.0] [--port 8000] [--mode nvfp4|fp8|exact] [--kv bf16|auto|fp8|q4] [--ctx 262144] [--max-tokens 65536] [--mtp 7] [--max-batch 8] [--mtp-ramp 7,1,1,1,0,0,0,0] [--prefill-chunk 1024] [--no-batch-dspark-commit] [--spec-threshold 0.75] [--temp 1.0] [--top-p 0.95] [--top-k 0] [--keep-history-thinking] [--ablation PATH] [--prefix-sessions 3] [--no-tool-constraint] [--max-reasoning-tokens 8192] [--no-loop-guard] [--model-name inkling-2-mini] [--effort none] [--api-key KEY]\n"
         "  squidDGX generate <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV | --tokens-file PATH) [--image PATH]... [--mode nvfp4] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--top-k 0] [--seed N] [--ablation PATH] [--max-tokens 65536] [--ctx 262144]\n"
         "  squidDGX bench    <model_dir> (--prompt TEXT | --prompt-file PATH | --tokens CSV) [--mode nvfp4] [--kv bf16] [--mtp 7] [--spec-threshold 0.75] [--temp 0.0] [--top-p 0.95] [--ablation PATH] [--max-tokens 128] [--runs 6] [--ctx 262144]\n"
         "  squidDGX longctx  <model_dir> [--mode nvfp4|fp8|exact] [--kv bf16|fp8|q4] [--ctx 262144]\n"
@@ -141,6 +141,8 @@ int main(int argc, char** argv) {
     uint16_t semif_port = 8897;
     uint32_t semif_max_tokens = 16384;
     uint32_t prefix_sessions = 3;
+    uint32_t max_batch_slots = (command == "serve") ? static_cast<uint32_t>(squid::MAX_BATCH_SLOTS) : 1u;
+    squid::MtpRampPolicy mtp_ramp{};
     bool constrain_tool_calls = true;
     bool loop_guard = true;
     uint32_t max_reasoning_tokens = 8192;
@@ -183,6 +185,26 @@ int main(int argc, char** argv) {
         else if (arg == "--no-loop-guard") { loop_guard = false; }
         else if (arg == "--max-reasoning-tokens" && has_val()) { max_reasoning_tokens = static_cast<uint32_t>(std::strtoul(argv[++arg_i], nullptr, 10)); }
         else if (arg == "--prefix-sessions" && has_val()) { prefix_sessions = static_cast<uint32_t>(std::strtoul(argv[++arg_i], nullptr, 10)); }
+        else if (arg == "--max-batch" && has_val()) {
+            max_batch_slots = std::clamp<uint32_t>(
+                static_cast<uint32_t>(std::strtoul(argv[++arg_i], nullptr, 10)),
+                1u, static_cast<uint32_t>(squid::MAX_BATCH_SLOTS));
+        }
+        else if (arg == "--prefill-chunk" && has_val()) {
+            uint32_t pc = static_cast<uint32_t>(std::strtoul(argv[++arg_i], nullptr, 10));
+            mtp_ramp.prefill_chunk_tokens = std::clamp<uint32_t>((pc + 7u) & ~7u, 32u, squid::PREFILL_BATCH_MAX);
+        }
+        else if (arg == "--no-batch-dspark-commit") { mtp_ramp.commit_dspark_in_batch = false; }
+        else if (arg == "--mtp-ramp" && has_val()) {
+            int32_t vals[squid::MAX_BATCH_SLOTS]{};
+            const size_t n = parse_csv_tokens(argv[++arg_i], vals, squid::MAX_BATCH_SLOTS);
+            for (size_t ri = 0; ri < n && ri < squid::MAX_BATCH_SLOTS; ++ri) {
+                mtp_ramp.drafts_by_c[ri + 1] = static_cast<uint32_t>(std::clamp(vals[ri], 0, squid::MTP_MAX_DRAFTS));
+            }
+            for (size_t ri = n; ri < squid::MAX_BATCH_SLOTS; ++ri) {
+                mtp_ramp.drafts_by_c[ri + 1] = 0u;
+            }
+        }
         else if (arg == "--semif-max-tokens" && has_val()) { semif_max_tokens = static_cast<uint32_t>(std::strtoul(argv[++arg_i], nullptr, 10)); }
         else if (arg == "--model-name" && has_val()) { model_name = argv[++arg_i]; model_name_explicit = true; }
         else if (arg == "--ablation" && has_val()) { ablation_path = argv[++arg_i]; }
@@ -378,7 +400,7 @@ int main(int argc, char** argv) {
     }
 
     squid::Engine engine{};
-    if (!engine.init(&model, ctx, use_graphs, kv_format)) {
+    if (!engine.init(&model, ctx, use_graphs, kv_format, max_batch_slots)) {
         model.deinit();
         squid::free_host(prompt_ids_buf);
         if (need_tokenizer) tokenizer.deinit();
@@ -410,6 +432,8 @@ int main(int argc, char** argv) {
         scfg.default_top_k = top_k;
         scfg.context_tokens_max = ctx;
         scfg.max_output_tokens = std::min(std::max(max_tokens, 1u), ctx);
+        scfg.max_batch_slots = max_batch_slots;
+        scfg.mtp_ramp = mtp_ramp;
         scfg.raw_thinking = raw_thinking;
         scfg.keep_history_thinking = keep_history_thinking;
         static char weights_id_buf[256];

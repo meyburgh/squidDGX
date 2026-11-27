@@ -38,7 +38,8 @@ struct PrefillPoolLayout {
 uint64_t compute_dspark_ws_floats(const ModelWeights& mw) {
     if (!mw.dspark.loaded) return 0;
     const uint64_t vd = static_cast<uint64_t>(mw.dspark.draft_vocab_size);
-    constexpr uint64_t kFixedFloats = 393216;
+    // Sized for up to MAX_DSPARK_SLOTS (4) concurrent 8-row DSpark blocks (32 rows) + Markov scratch
+    constexpr uint64_t kFixedFloats = 1179648;
     const uint64_t base_logits_floats = (mw.dspark.unembed_draft.kind == WeightKind::NVFP4)
                                             ? ((static_cast<uint64_t>(MTP_MAX_DRAFTS) * vd + 1) / 2)
                                             : (static_cast<uint64_t>(MTP_MAX_DRAFTS) * vd);
@@ -136,6 +137,8 @@ PrefillPoolLayout compute_prefill_pool_layout() {
 uint64_t compute_runtime_vram_bytes(
     const VisitInfo schedule[NUM_VISITS],
     uint32_t context_tokens_max,
+    uint32_t max_batch_slots,
+    uint32_t max_dspark_slots,
     KVFormat kv_format,
     bool has_dspark,
     uint64_t draft_vocab_count,
@@ -146,10 +149,11 @@ uint64_t compute_runtime_vram_bytes(
     for (int vi = 0; vi < NUM_VISITS; ++vi) {
         const bool is_glob = schedule[vi].is_global;
         const uint32_t cap = is_glob ? context_tokens_max : (SWA_WINDOW + PREFILL_LOCAL_ATTN_SUB);
+        const uint32_t alloc_cap = is_glob ? cap : (cap * max_batch_slots);
         const KVFormat vfmt = is_glob ? kv_format : KVFormat::BF16;
-        total += kv_cache_pair_vram_bytes(cap, vfmt);
-        total += 2 * align_up_u64(static_cast<uint64_t>(SCONV_RING_SLOTS) * KV_DIM * 4, a);
-        total += 2 * align_up_u64(static_cast<uint64_t>(SCONV_RING_SLOTS) * HIDDEN * 4, a);
+        total += kv_cache_pair_vram_bytes(alloc_cap, vfmt);
+        total += 2 * align_up_u64(static_cast<uint64_t>(max_batch_slots) * SCONV_RING_SLOTS * KV_DIM * 4, a);
+        total += 2 * align_up_u64(static_cast<uint64_t>(max_batch_slots) * SCONV_RING_SLOTS * HIDDEN * 4, a);
     }
 
     if (has_dspark) {
@@ -157,10 +161,11 @@ uint64_t compute_runtime_vram_bytes(
             const bool is_loc = is_mtp_local_layer(ml);
             const uint32_t cap = is_loc ? (SWA_WINDOW + MTP_BLOCK_SIZE)
                                         : (context_tokens_max > 524288 ? 65536u : context_tokens_max);
+            const uint32_t alloc_cap = is_loc ? (cap * max_dspark_slots) : cap;
             const KVFormat lfmt = is_loc ? KVFormat::BF16 : kv_format;
-            total += kv_cache_pair_vram_bytes(cap, lfmt);
+            total += kv_cache_pair_vram_bytes(alloc_cap, lfmt);
         }
-        total += align_up_u64(static_cast<uint64_t>(SCONV_RING_SLOTS) * HIDDEN * 4, a);
+        total += align_up_u64(static_cast<uint64_t>(max_dspark_slots) * SCONV_RING_SLOTS * HIDDEN * 4, a);
     }
 
     total += align_up_u64(SPLIT_BUFFER_FLOATS * 4, a);
@@ -202,10 +207,18 @@ uint64_t compute_runtime_vram_bytes(
     total += 2 * align_up_u64(b * 1024 * 4, a);
     total += align_up_u64(b * VOCAB_UNPADDED * 4, a);
     if (has_dspark) {
-        total += align_up_u64(static_cast<uint64_t>(MTP_MAX_DRAFTS) * draft_vocab_count * 4, a);
-        total += align_up_u64(static_cast<uint64_t>(MTP_MAX_DRAFTS) * 4, a);
+        total += align_up_u64(static_cast<uint64_t>(MTP_BLOCK_SIZE) * draft_vocab_count * 4, a);
+        total += align_up_u64(static_cast<uint64_t>(MTP_BLOCK_SIZE) * 4, a);
     }
     total += align_up_u64(sizeof(SampleConfig), a);
+    total += align_up_u64(static_cast<uint64_t>(MAX_BATCH_SLOTS) * MAX_KV_PAGES * sizeof(int32_t), a);
+    total += align_up_u64(static_cast<uint64_t>(MTP_BLOCK_SIZE) * sizeof(BatchTokenMeta), a);
+    total += align_up_u64(static_cast<uint64_t>(MAX_BATCH_SLOTS) * sizeof(BatchSeqMeta), a);
+    total += align_up_u64(static_cast<uint64_t>(MAX_BATCH_SLOTS) * sizeof(SampleConfig), a);
+    total += align_up_u64(static_cast<uint64_t>(MAX_BATCH_SLOTS) * sizeof(int32_t), a);
+    total += align_up_u64(static_cast<uint64_t>(MAX_BATCH_SLOTS) * sizeof(int32_t), a);
+    total += align_up_u64(static_cast<uint64_t>(MAX_DSPARK_SLOTS) * MTP_MAX_DRAFTS * sizeof(int32_t), a);
+    total += align_up_u64(static_cast<uint64_t>(MTP_BLOCK_SIZE) * sizeof(int32_t), a);
 
     constexpr uint64_t pb = PREFILL_BATCH_MAX;
     total += align_up_u64(pb * 4, a);
@@ -272,23 +285,28 @@ cudaGraphExec_t end_capture_and_instantiate(cudaStream_t stream) {
 
 } // namespace
 
-bool Engine::init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFormat kv_fmt) {
+bool Engine::init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFormat kv_fmt, uint32_t batch_slots) {
     SQUID_ASSERT(loaded != nullptr);
     SQUID_ASSERT(max_ctx >= 64);
     SQUID_ASSERT(arena.base_ptr == nullptr);
 
     model = loaded;
     context_tokens_max = max_ctx;
+    max_batch_slots = std::clamp<uint32_t>(batch_slots, 1u, static_cast<uint32_t>(MAX_BATCH_SLOTS));
+    max_dspark_slots = std::min<uint32_t>(max_batch_slots, static_cast<uint32_t>(MAX_DSPARK_SLOTS));
     use_graphs = graphs;
     kv_format = kv_fmt;
     build_visit_schedule(schedule);
+    kv_pool.init(context_tokens_max);
+    identity_page_table_ready = false;
 
     const bool has_dspark = loaded->mw.dspark.loaded;
     const uint64_t draft_vocab_count = has_dspark ? static_cast<uint64_t>(loaded->mw.dspark.draft_vocab_size) : 0;
     const uint64_t dspark_ws_floats = compute_dspark_ws_floats(loaded->mw);
 
     const uint64_t runtime_bytes = compute_runtime_vram_bytes(
-        schedule, context_tokens_max, kv_format, has_dspark, draft_vocab_count, dspark_ws_floats);
+        schedule, context_tokens_max, max_batch_slots, max_dspark_slots,
+        kv_format, has_dspark, draft_vocab_count, dspark_ws_floats);
     if (!check_spark_memory(loaded->arena.capacity_bytes, runtime_bytes)) return false;
 
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -302,13 +320,14 @@ bool Engine::init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFo
     for (int vi = 0; vi < NUM_VISITS; ++vi) {
         const bool is_glob = schedule[vi].is_global;
         const uint32_t cap = is_glob ? context_tokens_max : (SWA_WINDOW + PREFILL_LOCAL_ATTN_SUB);
+        const uint32_t alloc_cap = is_glob ? cap : (cap * max_batch_slots);
         const KVFormat vfmt = is_glob ? kv_format : KVFormat::BF16;
         kv_cap[vi] = static_cast<int>(cap);
-        alloc_kv_pair(cap, vfmt, &k_cache[vi], &v_cache[vi], &k_scale[vi], &v_scale[vi]);
-        k_ring[vi] = arena.alloc_many<float>(SCONV_RING_SLOTS * KV_DIM);
-        v_ring[vi] = arena.alloc_many<float>(SCONV_RING_SLOTS * KV_DIM);
-        attn_ring[vi] = arena.alloc_many<float>(SCONV_RING_SLOTS * HIDDEN);
-        mlp_ring[vi] = arena.alloc_many<float>(SCONV_RING_SLOTS * HIDDEN);
+        alloc_kv_pair(alloc_cap, vfmt, &k_cache[vi], &v_cache[vi], &k_scale[vi], &v_scale[vi]);
+        k_ring[vi] = arena.alloc_many<float>(static_cast<uint64_t>(max_batch_slots) * SCONV_RING_SLOTS * KV_DIM);
+        v_ring[vi] = arena.alloc_many<float>(static_cast<uint64_t>(max_batch_slots) * SCONV_RING_SLOTS * KV_DIM);
+        attn_ring[vi] = arena.alloc_many<float>(static_cast<uint64_t>(max_batch_slots) * SCONV_RING_SLOTS * HIDDEN);
+        mlp_ring[vi] = arena.alloc_many<float>(static_cast<uint64_t>(max_batch_slots) * SCONV_RING_SLOTS * HIDDEN);
     }
 
     if (has_dspark) {
@@ -316,11 +335,12 @@ bool Engine::init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFo
             const bool is_loc = is_mtp_local_layer(ml);
             const uint32_t cap = is_loc ? (SWA_WINDOW + MTP_BLOCK_SIZE)
                                         : (context_tokens_max > 524288 ? 65536u : context_tokens_max);
+            const uint32_t alloc_cap = is_loc ? (cap * max_dspark_slots) : cap;
             const KVFormat lfmt = is_loc ? KVFormat::BF16 : kv_format;
             ds_kv_cap[ml] = static_cast<int>(cap);
-            alloc_kv_pair(cap, lfmt, &ds_k_cache[ml], &ds_v_cache[ml], &ds_k_scale[ml], &ds_v_scale[ml]);
+            alloc_kv_pair(alloc_cap, lfmt, &ds_k_cache[ml], &ds_v_cache[ml], &ds_k_scale[ml], &ds_v_scale[ml]);
         }
-        ds_f_ring = arena.alloc_many<float>(SCONV_RING_SLOTS * HIDDEN);
+        ds_f_ring = arena.alloc_many<float>(static_cast<uint64_t>(max_dspark_slots) * SCONV_RING_SLOTS * HIDDEN);
     }
 
     split_buf = arena.alloc_many<float>(SPLIT_BUFFER_FLOATS);
@@ -348,6 +368,11 @@ bool Engine::init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFo
     CUDA_CHECK(cudaHostAlloc(&h_ld_raw, sizeof(LookupDraft), cudaHostAllocDefault));
     h_lookup_draft = static_cast<LookupDraft*>(h_ld_raw);
     h_lookup_draft->is_delta = 1;
+
+    void* h_bio_raw = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&h_bio_raw, sizeof(BatchStepHostIO), cudaHostAllocDefault));
+    h_batch_io = static_cast<BatchStepHostIO*>(h_bio_raw);
+    std::memset(h_batch_io, 0, sizeof(BatchStepHostIO));
 
     hidden = arena.alloc_many<float>(b_max * HIDDEN);
     prelude = arena.alloc_many<float>(b_max * HIDDEN);
@@ -389,10 +414,18 @@ bool Engine::init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFo
     lm_blk_idx = arena.alloc_many<int32_t>(b_max * 1024);
     lm_logits = arena.alloc_many<float>(b_max * VOCAB_UNPADDED);
     if (has_dspark) {
-        d_draft_probs = arena.alloc_many<float>(static_cast<uint64_t>(MTP_MAX_DRAFTS) * draft_vocab_count);
-        d_draft_q_sel = arena.alloc_many<float>(MTP_MAX_DRAFTS);
+        d_draft_probs = arena.alloc_many<float>(static_cast<uint64_t>(MTP_BLOCK_SIZE) * draft_vocab_count);
+        d_draft_q_sel = arena.alloc_many<float>(MTP_BLOCK_SIZE);
     }
     d_sample_cfg = arena.alloc_one<SampleConfig>();
+    d_page_table = arena.alloc_many<int32_t>(static_cast<uint64_t>(MAX_BATCH_SLOTS) * MAX_KV_PAGES);
+    d_tok_meta = arena.alloc_many<BatchTokenMeta>(MTP_BLOCK_SIZE);
+    d_seq_meta = arena.alloc_many<BatchSeqMeta>(MAX_BATCH_SLOTS);
+    d_sample_cfgs = arena.alloc_many<SampleConfig>(MAX_BATCH_SLOTS);
+    d_slot_pos = arena.alloc_many<int32_t>(MAX_BATCH_SLOTS);
+    d_slot_anchor = arena.alloc_many<int32_t>(MAX_BATCH_SLOTS);
+    d_slot_drafts = arena.alloc_many<int32_t>(static_cast<uint64_t>(MAX_DSPARK_SLOTS) * MTP_MAX_DRAFTS);
+    d_batch_draft_tokens = arena.alloc_many<int32_t>(MTP_BLOCK_SIZE);
     const SampleConfig zero_cfg{0.0f, 1.0f, 0, 0, 0};
     const int32_t zero_i32 = 0;
     CUDA_CHECK(cudaMemcpyAsync(d_sample_cfg, &zero_cfg, sizeof(SampleConfig), cudaMemcpyHostToDevice, stream));
@@ -449,8 +482,9 @@ bool Engine::init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFo
     launch_prefill_warmup_cublas(stream);
 
     const double rt_gib = static_cast<double>(arena.capacity_bytes) / (1024.0 * 1024.0 * 1024.0);
-    printf("[engine] Initialized max_ctx=%u | kv=%s | runtime VRAM=%.2f GiB (1 arena, %u slices) | graphs=%s\n",
-           context_tokens_max, kv_format_name(kv_format), rt_gib, arena.allocation_count,
+    printf("[engine] Initialized max_ctx=%u | kv=%s | slots=%u (ds=%u) | kv_pages=%ux%d | runtime VRAM=%.2f GiB (1 arena, %u slices) | graphs=%s\n",
+           context_tokens_max, kv_format_name(kv_format), max_batch_slots, max_dspark_slots,
+           kv_pool.total_pages, KV_PAGE_SIZE, rt_gib, arena.allocation_count,
            use_graphs ? "on" : "off");
     std::fflush(stdout);
     reset();
@@ -470,10 +504,15 @@ void Engine::deinit() {
         if (prefill_b8_graph_exec[i]) CUDA_CHECK(cudaGraphExecDestroy(prefill_b8_graph_exec[i]));
         prefill_b8_graph_exec[i] = nullptr;
     }
+    for (size_t i = 0; i < BATCH_GRAPH_CACHE_MAX; ++i) {
+        if (batch_graphs[i].exec) CUDA_CHECK(cudaGraphExecDestroy(batch_graphs[i].exec));
+        batch_graphs[i] = BatchGraphEntry{};
+    }
     if (d_vis_dst) CUDA_CHECK(cudaFree(d_vis_dst));
     if (d_vis_src) CUDA_CHECK(cudaFree(d_vis_src));
     if (h_decode_result) CUDA_CHECK(cudaFreeHost(h_decode_result));
     if (h_lookup_draft) CUDA_CHECK(cudaFreeHost(h_lookup_draft));
+    if (h_batch_io) CUDA_CHECK(cudaFreeHost(h_batch_io));
     deinit_prefix_cache();
     arena.deinit();
     if (done_event) CUDA_CHECK(cudaEventDestroy(done_event));
@@ -484,9 +523,18 @@ void Engine::deinit() {
     *this = Engine{};
 }
 
+void Engine::ensure_identity_page_table_slot0() {
+    if (identity_page_table_ready || kv_pool.total_pages == 0) return;
+    int32_t id_pages[MAX_KV_PAGES];
+    for (uint32_t p = 0; p < kv_pool.total_pages; ++p) id_pages[p] = static_cast<int32_t>(p);
+    CUDA_CHECK(cudaMemcpyAsync(d_page_table, id_pages, kv_pool.total_pages * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    identity_page_table_ready = true;
+}
+
 void Engine::reset() {
     SQUID_ASSERT(stream != nullptr);
     current_position = 0;
+    ensure_identity_page_table_slot0();
     CUDA_CHECK(cudaMemsetAsync(d_pos, 0, sizeof(int32_t), stream));
     for (int vi = 0; vi < NUM_VISITS; ++vi) {
         CUDA_CHECK(cudaMemsetAsync(k_ring[vi], 0, SCONV_RING_SLOTS * KV_DIM * 4, stream));
@@ -498,6 +546,45 @@ void Engine::reset() {
         CUDA_CHECK(cudaMemsetAsync(ds_f_ring, 0, SCONV_RING_SLOTS * HIDDEN * 4, stream));
     }
     CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void Engine::reset_slot(int slot_id) {
+    SQUID_ASSERT(slot_id >= 0 && static_cast<uint32_t>(slot_id) < max_batch_slots);
+    identity_page_table_ready = false;
+    kv_pool.release_slot(slot_id);
+    for (int vi = 0; vi < NUM_VISITS; ++vi) {
+        CUDA_CHECK(cudaMemsetAsync(k_ring[vi] + static_cast<size_t>(slot_id) * SCONV_RING_SLOTS * KV_DIM, 0, SCONV_RING_SLOTS * KV_DIM * 4, stream));
+        CUDA_CHECK(cudaMemsetAsync(v_ring[vi] + static_cast<size_t>(slot_id) * SCONV_RING_SLOTS * KV_DIM, 0, SCONV_RING_SLOTS * KV_DIM * 4, stream));
+        CUDA_CHECK(cudaMemsetAsync(attn_ring[vi] + static_cast<size_t>(slot_id) * SCONV_RING_SLOTS * HIDDEN, 0, SCONV_RING_SLOTS * HIDDEN * 4, stream));
+        CUDA_CHECK(cudaMemsetAsync(mlp_ring[vi] + static_cast<size_t>(slot_id) * SCONV_RING_SLOTS * HIDDEN, 0, SCONV_RING_SLOTS * HIDDEN * 4, stream));
+    }
+    if (ds_f_ring && static_cast<uint32_t>(slot_id) < max_dspark_slots) {
+        CUDA_CHECK(cudaMemsetAsync(ds_f_ring + static_cast<size_t>(slot_id) * SCONV_RING_SLOTS * HIDDEN, 0, SCONV_RING_SLOTS * HIDDEN * 4, stream));
+    }
+}
+
+bool Engine::ensure_slot_kv(int slot_id, uint32_t needed_tokens) {
+    SQUID_ASSERT(slot_id >= 0 && static_cast<uint32_t>(slot_id) < max_batch_slots);
+    const uint32_t old_n = kv_pool.slot_num_pages[slot_id];
+    const uint32_t need_n = kv_pool.needed_pages_for(needed_tokens);
+    if (need_n > static_cast<uint32_t>(MAX_KV_PAGES)) return false;
+    if (need_n <= old_n) return true;
+    if ((need_n - old_n) > kv_pool.free_count) return false;
+    identity_page_table_ready = false;
+    while (kv_pool.slot_num_pages[slot_id] < need_n) {
+        kv_pool.slot_pages[slot_id][kv_pool.slot_num_pages[slot_id]++] = kv_pool.free_stack[--kv_pool.free_count];
+    }
+    CUDA_CHECK(cudaMemcpyAsync(
+        d_page_table + static_cast<size_t>(slot_id) * MAX_KV_PAGES + old_n,
+        kv_pool.slot_pages[slot_id] + old_n,
+        static_cast<size_t>(need_n - old_n) * sizeof(int32_t),
+        cudaMemcpyHostToDevice, stream));
+    return true;
+}
+
+void Engine::release_slot_kv(int slot_id) {
+    SQUID_ASSERT(slot_id >= 0 && static_cast<uint32_t>(slot_id) < max_batch_slots);
+    kv_pool.release_slot(slot_id);
 }
 
 void Engine::alloc_kv_pair(uint32_t cap_tokens, KVFormat fmt, void** k_out, void** v_out, __half** ks_out, __half** vs_out) {
@@ -971,6 +1058,7 @@ GenerateStats Engine::generate_with_hint(
     CUDA_CHECK(cudaMemcpyAsync(d_sample_cfg, &cfg_h, sizeof(SampleConfig), cudaMemcpyHostToDevice, stream));
 
     const uint64_t prefill_start_ns = clock_monotonic_ns();
+    ensure_identity_page_table_slot0();
     uint32_t start_pos = 0;
     uint32_t shield_tokens = 0;
     const bool has_vision_input = (vision.d_embeds != nullptr && vision.count > 0);
@@ -1244,11 +1332,12 @@ GenerateStats Engine::generate_with_hint(
             } else {
                 const __half* ds_ks_const[MTP_LAYERS] = {ds_k_scale[0], ds_k_scale[1], ds_k_scale[2]};
                 const __half* ds_vs_const[MTP_LAYERS] = {ds_v_scale[0], ds_v_scale[1], ds_v_scale[2]};
+                const int32_t* ds_pt0 = (kv_pool.total_pages > 0 && ds_kv_cap[1] == static_cast<int>(context_tokens_max)) ? d_page_table : nullptr;
                 launch_dspark_draft(
                     mw, d_anchor, d_pos, static_cast<int>(num_drafts),
                     ds_k_cache, ds_v_cache, ds_ks_const, ds_vs_const, ds_kv_cap, kv_format,
                     split_buf, ds_f_ring, ds_ws, d_drafts, nullptr, 0.0f,
-                    d_sample_cfg, d_draft_probs, d_draft_q_sel, d_draft_is_delta, stream);
+                    d_sample_cfg, d_draft_probs, d_draft_q_sel, d_draft_is_delta, stream, ds_pt0);
                 launch_assemble_verify_tokens(d_anchor, d_drafts, d_tokens, static_cast<int32_t>(num_drafts), stream);
                 record_target_forward(batch, true, true, true);
                 launch_spec_verify(d_next_tokens, d_drafts, batch, d_decode_result->tokens, &d_decode_result->accepted_count, d_pos, d_anchor, stream);
@@ -1382,33 +1471,43 @@ uint32_t Engine::prefill_final_range(const int32_t* prompt, uint32_t start_i, ui
 }
 
 void Engine::prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint32_t chunk_len, bool commit_dspark) {
+    prefill_chunk_batched_slot(0, prompt + start_i, static_cast<uint32_t>(current_position), chunk_len, commit_dspark);
+    current_position += static_cast<int32_t>(chunk_len);
+}
+
+void Engine::prefill_chunk_batched_slot(int slot_id, const int32_t* prompt_chunk, uint32_t start_pos, uint32_t chunk_len, bool commit_dspark) {
+    SQUID_ASSERT(slot_id >= 0 && static_cast<uint32_t>(slot_id) < max_batch_slots);
     SQUID_ASSERT(chunk_len >= 8 && chunk_len <= PREFILL_BATCH_MAX && (chunk_len % 8) == 0);
     const LoadedModel& lm = *model;
     const ModelWeights& mw = lm.mw;
     const int b_i32 = static_cast<int>(chunk_len);
     const size_t b_usize = chunk_len;
     const size_t n_sub = chunk_len / 8;
+    const int32_t* slot_pt = (kv_pool.total_pages > 0) ? (d_page_table + static_cast<size_t>(slot_id) * MAX_KV_PAGES) : nullptr;
 
     int32_t h_pos_vec[PREFILL_SUB_CHUNKS_MAX];
     for (size_t s = 0; s < n_sub; ++s) {
-        h_pos_vec[s] = current_position + static_cast<int32_t>(s * 8);
+        h_pos_vec[s] = static_cast<int32_t>(start_pos + s * 8);
     }
     CUDA_CHECK(cudaMemcpyAsync(p_pos_vec, h_pos_vec, n_sub * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(p_tokens, prompt + start_i, b_usize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(p_tokens, prompt_chunk, b_usize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
     launch_embed_norm(mw.embed, mw.embed_norm, p_tokens, p_hidden, b_i32, stream);
-    scatter_chunk_vision(prompt + start_i, b_i32, p_hidden);
+    scatter_chunk_vision(prompt_chunk, b_i32, p_hidden);
 
     int block_count = 0;
     bool has_prior = false;
     bool prev_mlp_pending = false;
 
-    const bool prof_on = (std::getenv("SQUID_PROF_PREFILL") != nullptr && start_i == 0);
+    const bool prof_on = (std::getenv("SQUID_PROF_PREFILL") != nullptr && start_pos == 0);
     uint64_t t_pre = 0, t_dense = 0, t_attn = 0, t_post = 0, t_moe = 0, t_commit = 0, t_mark = 0;
     if (prof_on) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
         t_mark = clock_monotonic_ns();
     }
+
+    const size_t kv_ring_off = static_cast<size_t>(slot_id) * SCONV_RING_SLOTS * KV_DIM;
+    const size_t h_ring_off = static_cast<size_t>(slot_id) * SCONV_RING_SLOTS * HIDDEN;
 
     for (int vi = 0; vi < NUM_VISITS; ++vi) {
         const VisitInfo& v = schedule[vi];
@@ -1439,7 +1538,7 @@ void Engine::prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint
             const LayerWeights& prev_lw = mw.layers[schedule[vi - 1].physical_layer];
             const AblationSlice abl = ablation_slice(lm, true, vi - 1);
             launch_prefill_sconv_post_res(
-                p_moe_slot_out, 0, prev_lw.mlp_sconv_w, mlp_ring[vi - 1],
+                p_moe_slot_out, 0, prev_lw.mlp_sconv_w, mlp_ring[vi - 1] + h_ring_off,
                 p_residual, p_hidden, capture_prelude ? p_prelude : nullptr,
                 nullptr, nullptr, 0, 0, b_i32, &p_pos_vec[0], abl.r, abl.d, abl.p, stream);
             if (tap_slot >= 0) {
@@ -1516,13 +1615,15 @@ void Engine::prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint
             launch_prefill_global_sconv_prep_store(
                 p_qrgs, p_k_proj, p_v_proj, in_kh, in_vh,
                 lw.k_sconv_w, lw.v_sconv_w, lw.k_sconv_proj, lw.v_sconv_proj,
-                k_ring[vi], v_ring[vi], lw.q_clip_scale, lw.rel_clip_scale,
+                k_ring[vi] + kv_ring_off, v_ring[vi] + kv_ring_off, lw.q_clip_scale, lw.rel_clip_scale,
                 k_cache[vi], v_cache[vi], k_scale[vi], v_scale[vi],
-                kv_format, kv_cap[vi], p_ctrl_d, p_w_f16, b_i32, &p_pos_vec[0], stream);
+                kv_format, kv_cap[vi], p_ctrl_d, p_w_f16, b_i32, &p_pos_vec[0], stream, slot_pt);
             launch_prefill_flash_attn_tc(
                 p_qrgs, lw.rel_logits_proj, k_cache[vi], v_cache[vi], k_scale[vi], v_scale[vi],
-                kv_format, p_attn_gated_h, kv_cap[vi], 0, b_i32, &p_pos_vec[0], stream);
+                kv_format, p_attn_gated_h, kv_cap[vi], 0, b_i32, &p_pos_vec[0], stream, slot_pt);
         } else {
+            __nv_bfloat16* kc_loc = static_cast<__nv_bfloat16*>(k_cache[vi]) + static_cast<size_t>(slot_id) * kv_cap[vi] * KV_DIM;
+            __nv_bfloat16* vc_loc = static_cast<__nv_bfloat16*>(v_cache[vi]) + static_cast<size_t>(slot_id) * kv_cap[vi] * KV_DIM;
             for (uint32_t off_u32 = 0; off_u32 < chunk_len; ) {
                 const uint32_t sub_b = std::min(PREFILL_LOCAL_ATTN_SUB, chunk_len - off_u32);
                 const size_t off = off_u32;
@@ -1533,13 +1634,12 @@ void Engine::prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint
 
                 launch_prefill_local_sconv_prep_store(
                     qrgs_sub, k_sub, v_sub, lw.k_sconv_w, lw.v_sconv_w,
-                    k_ring[vi], v_ring[vi], lw.q_clip_scale, lw.rel_clip_scale,
-                    static_cast<__nv_bfloat16*>(k_cache[vi]), static_cast<__nv_bfloat16*>(v_cache[vi]),
-                    kv_cap[vi], static_cast<int>(sub_b), d_pos_sub, stream);
+                    k_ring[vi] + kv_ring_off, v_ring[vi] + kv_ring_off, lw.q_clip_scale, lw.rel_clip_scale,
+                    kc_loc, vc_loc, kv_cap[vi], static_cast<int>(sub_b), d_pos_sub, stream);
                 launch_prefill_flash_attn_tc(
-                    qrgs_sub, lw.rel_logits_proj, k_cache[vi], v_cache[vi], nullptr, nullptr,
+                    qrgs_sub, lw.rel_logits_proj, kc_loc, vc_loc, nullptr, nullptr,
                     KVFormat::BF16, p_attn_gated_h + off * Q_DIM,
-                    kv_cap[vi], SWA_WINDOW, static_cast<int>(sub_b), d_pos_sub, stream);
+                    kv_cap[vi], SWA_WINDOW, static_cast<int>(sub_b), d_pos_sub, stream, nullptr);
                 off_u32 += sub_b;
             }
         }
@@ -1559,7 +1659,7 @@ void Engine::prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint
         const bool is_boundary = (l % BLOCK_LAYERS == 0);
         const AblationSlice attn_abl = ablation_slice(lm, false, vi);
         launch_prefill_sconv_post_res(
-            p_o_proj, 0, lw.attn_sconv_w, attn_ring[vi], p_hidden, p_residual, nullptr,
+            p_o_proj, 0, lw.attn_sconv_w, attn_ring[vi] + h_ring_off, p_hidden, p_residual, nullptr,
             p_blocks, p_partial, block_count, is_boundary ? 1 : 0, b_i32, &p_pos_vec[0],
             attn_abl.r, attn_abl.d, attn_abl.p, stream);
         if (is_boundary) block_count += 1;
@@ -1609,7 +1709,7 @@ void Engine::prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint
         if (vi == 17 || vi == 29) {
             const AblationSlice mlp_abl = ablation_slice(lm, true, vi);
             launch_prefill_sconv_post_res(
-                p_moe_slot_out, 0, lw.mlp_sconv_w, mlp_ring[vi], p_residual, p_hidden, nullptr,
+                p_moe_slot_out, 0, lw.mlp_sconv_w, mlp_ring[vi] + h_ring_off, p_residual, p_hidden, nullptr,
                 nullptr, nullptr, 0, 0, b_i32, &p_pos_vec[0], mlp_abl.r, mlp_abl.d, mlp_abl.p, stream);
             prev_mlp_pending = false;
         } else {
@@ -1620,18 +1720,30 @@ void Engine::prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint
     const LayerWeights& last_lw = mw.layers[schedule[NUM_VISITS - 1].physical_layer];
     const AblationSlice last_mlp_abl = ablation_slice(lm, true, NUM_VISITS - 1);
     launch_prefill_sconv_post_res(
-        p_moe_slot_out, 0, last_lw.mlp_sconv_w, mlp_ring[NUM_VISITS - 1], p_residual, p_hidden, nullptr,
+        p_moe_slot_out, 0, last_lw.mlp_sconv_w, mlp_ring[NUM_VISITS - 1] + h_ring_off, p_residual, p_hidden, nullptr,
         nullptr, nullptr, 0, 0, b_i32, &p_pos_vec[0], last_mlp_abl.r, last_mlp_abl.d, last_mlp_abl.p, stream);
     launch_fused_depth_norm(
         p_hidden, nullptr, p_blocks, block_count, mw.output_query,
         mw.final_norm, nullptr, nullptr, p_mlp_normed, nullptr, nullptr,
         nullptr, nullptr, nullptr, 1, b_i32, stream);
 
-    if (commit_dspark) {
+    if (commit_dspark && mw.dspark.loaded && static_cast<uint32_t>(slot_id) < max_dspark_slots) {
         launch_prefill_copy_taps(p_mlp_normed, p_taps, 3, b_i32, stream);
+        void* dsk[MTP_LAYERS];
+        void* dsv[MTP_LAYERS];
+        for (int ml = 0; ml < MTP_LAYERS; ++ml) {
+            if (is_mtp_local_layer(ml)) {
+                dsk[ml] = static_cast<__nv_bfloat16*>(ds_k_cache[ml]) + static_cast<size_t>(slot_id) * ds_kv_cap[ml] * KV_DIM;
+                dsv[ml] = static_cast<__nv_bfloat16*>(ds_v_cache[ml]) + static_cast<size_t>(slot_id) * ds_kv_cap[ml] * KV_DIM;
+            } else {
+                dsk[ml] = ds_k_cache[ml];
+                dsv[ml] = ds_v_cache[ml];
+            }
+        }
+        const int32_t* ds_pt = (kv_pool.total_pages > 0 && ds_kv_cap[1] == static_cast<int>(context_tokens_max)) ? slot_pt : nullptr;
         launch_prefill_dspark_commit(
-            mw.dspark, p_taps, ds_k_cache, ds_v_cache, ds_k_scale, ds_v_scale, ds_kv_cap,
-            kv_format, ds_f_ring, p_attn_in_h[0], p_qrgs, p_w_f16, b_i32, &p_pos_vec[0], stream);
+            mw.dspark, p_taps, dsk, dsv, ds_k_scale, ds_v_scale, ds_kv_cap,
+            kv_format, ds_f_ring + h_ring_off, p_attn_in_h[0], p_qrgs, p_w_f16, b_i32, &p_pos_vec[0], stream, ds_pt);
     }
 
     if (prof_on) {
@@ -1645,7 +1757,6 @@ void Engine::prefill_chunk_batched(const int32_t* prompt, uint32_t start_i, uint
                static_cast<double>(t_moe) / 1e6, static_cast<double>(t_commit) / 1e6);
         std::fflush(stdout);
     }
-    current_position += b_i32;
 }
 
 double Engine::bench_step_at_pos(int32_t sim_pos_in, uint32_t num_drafts, uint32_t iterations) {
@@ -1874,19 +1985,20 @@ void Engine::record_target_forward(int32_t batch_size, bool commit_dspark, bool 
             launch_linear(lw.w_v, in_v, v_proj, batch_size, false, stream);
         }
 
+        const int32_t* slot0_pt = (kv_pool.total_pages > 0) ? d_page_table : nullptr;
         if (v.is_global) {
             launch_mega_global_sconv_prep_store(
                 qrgs, k_proj, v_proj, in_k, in_v,
                 lw.k_sconv_w, lw.v_sconv_w, lw.k_sconv_proj, lw.v_sconv_proj,
                 k_ring[vi], v_ring[vi], lw.q_clip_scale, lw.rel_clip_scale,
                 k_cache[vi], v_cache[vi], k_scale[vi], v_scale[vi],
-                kv_format, kv_cap[vi], batch_size, d_pos, stream);
+                kv_format, kv_cap[vi], batch_size, d_pos, stream, nullptr, slot0_pt);
         } else {
             launch_mega_local_sconv_prep_store(
                 qrgs, k_proj, v_proj, lw.k_sconv_w, lw.v_sconv_w,
                 k_ring[vi], v_ring[vi], lw.q_clip_scale, lw.rel_clip_scale,
                 static_cast<__nv_bfloat16*>(k_cache[vi]), static_cast<__nv_bfloat16*>(v_cache[vi]),
-                kv_cap[vi], batch_size, d_pos, stream);
+                kv_cap[vi], batch_size, d_pos, stream, nullptr);
         }
 
         launch_relative_attention_gated(
@@ -1895,7 +2007,8 @@ void Engine::record_target_forward(int32_t batch_size, bool commit_dspark, bool 
             split_buf,
             use_half_dense ? nullptr : attn_gated,
             use_half_dense ? attn_gated_h : nullptr,
-            kv_cap[vi], v.is_global ? 0 : SWA_WINDOW, batch_size, d_pos, stream);
+            kv_cap[vi], v.is_global ? 0 : SWA_WINDOW, batch_size, d_pos, stream,
+            v.is_global ? slot0_pt : nullptr);
 
         if (use_half_dense) {
             launch_linear_h(lw.w_o, attn_gated_h, o_proj, batch_size, false, stream);
@@ -1963,13 +2076,14 @@ void Engine::record_target_forward(int32_t batch_size, bool commit_dspark, bool 
         nullptr, nullptr, nullptr, 1, batch_size, d_pos,
         last_mlp_abl.r, last_mlp_abl.d, last_mlp_abl.p, stream);
 
+    const int32_t* ds_pt0 = (kv_pool.total_pages > 0 && ds_kv_cap[1] == static_cast<int>(context_tokens_max)) ? d_page_table : nullptr;
     if (compute_lm_head) {
         if (commit_dspark) {
             CUDA_CHECK(cudaEventRecord(fork_event, stream));
             CUDA_CHECK(cudaStreamWaitEvent(aux_stream, fork_event, 0));
             launch_dspark_commit(
                 mw.dspark, taps, ds_k_cache, ds_v_cache, ds_k_scale, ds_v_scale, ds_kv_cap,
-                kv_format, ds_f_ring, ds_mix, ds_kv, batch_size, d_pos, aux_stream);
+                kv_format, ds_f_ring, ds_mix, ds_kv, batch_size, d_pos, aux_stream, nullptr, ds_pt0);
             CUDA_CHECK(cudaEventRecord(join_event, aux_stream));
         }
         launch_lm_head_argmax(
@@ -1987,7 +2101,7 @@ void Engine::record_target_forward(int32_t batch_size, bool commit_dspark, bool 
     } else if (commit_dspark) {
         launch_dspark_commit(
             mw.dspark, taps, ds_k_cache, ds_v_cache, ds_k_scale, ds_v_scale, ds_kv_cap,
-            kv_format, ds_f_ring, ds_mix, ds_kv, batch_size, d_pos, stream);
+            kv_format, ds_f_ring, ds_mix, ds_kv, batch_size, d_pos, stream, nullptr, ds_pt0);
     }
 }
 
@@ -2016,12 +2130,13 @@ void Engine::ensure_spec_graph(uint32_t num_drafts) {
     const __half* ds_ks_const[MTP_LAYERS] = {ds_k_scale[0], ds_k_scale[1], ds_k_scale[2]};
     const __half* ds_vs_const[MTP_LAYERS] = {ds_v_scale[0], ds_v_scale[1], ds_v_scale[2]};
 
+    const int32_t* ds_pt0 = (kv_pool.total_pages > 0 && ds_kv_cap[1] == static_cast<int>(context_tokens_max)) ? d_page_table : nullptr;
     CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
     launch_dspark_draft(
         mw, d_anchor, d_pos, static_cast<int>(num_drafts),
         ds_k_cache, ds_v_cache, ds_ks_const, ds_vs_const, ds_kv_cap, kv_format,
         split_buf, ds_f_ring, ds_ws, d_drafts, nullptr, 0.0f,
-        d_sample_cfg, d_draft_probs, d_draft_q_sel, d_draft_is_delta, stream);
+        d_sample_cfg, d_draft_probs, d_draft_q_sel, d_draft_is_delta, stream, ds_pt0);
     launch_assemble_verify_tokens(d_anchor, d_drafts, d_tokens, static_cast<int32_t>(num_drafts), stream);
     record_target_forward(batch, true, true, true);
     launch_spec_verify(d_next_tokens, d_drafts, batch, d_decode_result->tokens, &d_decode_result->accepted_count, d_pos, d_anchor, stream);
@@ -2033,6 +2148,7 @@ void Engine::ensure_adaptive_graphs() {
     const ModelWeights& mw = model->mw;
     const __half* ds_ks_const[MTP_LAYERS] = {ds_k_scale[0], ds_k_scale[1], ds_k_scale[2]};
     const __half* ds_vs_const[MTP_LAYERS] = {ds_v_scale[0], ds_v_scale[1], ds_v_scale[2]};
+    const int32_t* ds_pt0 = (kv_pool.total_pages > 0 && ds_kv_cap[1] == static_cast<int>(context_tokens_max)) ? d_page_table : nullptr;
 
     if (draft_graph_exec && adaptive_graph_threshold != spec_threshold) {
         CUDA_CHECK(cudaGraphExecDestroy(draft_graph_exec));
@@ -2045,7 +2161,7 @@ void Engine::ensure_adaptive_graphs() {
             mw, d_anchor, d_pos, MTP_MAX_DRAFTS,
             ds_k_cache, ds_v_cache, ds_ks_const, ds_vs_const, ds_kv_cap, kv_format,
             split_buf, ds_f_ring, ds_ws, d_drafts, d_draft_conf, spec_threshold,
-            d_sample_cfg, d_draft_probs, d_draft_q_sel, d_draft_is_delta, stream);
+            d_sample_cfg, d_draft_probs, d_draft_q_sel, d_draft_is_delta, stream, ds_pt0);
         draft_graph_exec = end_capture_and_instantiate(stream);
     }
 
@@ -2074,6 +2190,988 @@ void Engine::ensure_adaptive_graphs() {
     }
     CUDA_CHECK(adaptive_graph_instantiate(adaptive_graph));
     adaptive_graph_threshold = spec_threshold;
+}
+
+void Engine::record_batched_target_forward(
+    int32_t batch_size, int32_t num_seqs, int32_t max_seq_width,
+    bool commit_dspark, bool compute_lm_head, bool is_verify, int32_t ctx_bucket) {
+    SQUID_ASSERT(batch_size >= 1 && batch_size <= MTP_BLOCK_SIZE);
+    SQUID_ASSERT(num_seqs >= 1 && num_seqs <= MAX_BATCH_SLOTS);
+    const LoadedModel& lm = *model;
+    const ModelWeights& mw = lm.mw;
+    const size_t b_usize = static_cast<size_t>(batch_size);
+    const int32_t* pt_all = (kv_pool.total_pages > 0) ? d_page_table : nullptr;
+
+    launch_embed_norm(mw.embed, mw.embed_norm, d_tokens, hidden, batch_size, stream);
+
+    int block_count = 0;
+    bool has_prior = false;
+    bool prev_mlp_pending = false;
+
+    for (int vi = 0; vi < NUM_VISITS; ++vi) {
+        const VisitInfo& v = schedule[vi];
+        const int l = v.physical_layer;
+        const LayerWeights& lw = mw.layers[l];
+
+        float* pre_tap_out = nullptr;
+        if (v.is_loop && l == LOOP_START) {
+            if (v.pass == 0) {
+                pre_tap_out = prelude;
+            } else {
+                launch_extract_block(blocks, 4, 2, saved, batch_size, stream);
+                launch_rmsnorm(hidden, nullptr, prior_last, batch_size, HIDDEN, HIDDEN, RMS_EPS, stream);
+                CUDA_CHECK(cudaMemcpyAsync(hidden, prelude, b_usize * HIDDEN * 4, cudaMemcpyDeviceToDevice, stream));
+                block_count = 1;
+                has_prior = true;
+            }
+        }
+        const bool use_prior = v.is_loop && has_prior;
+
+        if (commit_dspark) {
+            if (vi == MTP_TARGET_VISITS[0]) pre_tap_out = taps;
+            else if (vi == MTP_TARGET_VISITS[1]) pre_tap_out = taps + b_usize * HIDDEN;
+            else if (vi == MTP_TARGET_VISITS[2]) pre_tap_out = taps + 2 * b_usize * HIDDEN;
+        }
+
+        const bool distinct_inputs = v.is_global || use_prior;
+        float* partial_dst = (l % BLOCK_LAYERS == 0) ? partial : nullptr;
+        const bool use_half_dense = (lw.w_qrgs.kind != WeightKind::BF16);
+
+        const __nv_bfloat16 *n0 = nullptr, *n1 = nullptr, *n2 = nullptr;
+        float *o0 = nullptr, *o1 = nullptr, *o2 = nullptr;
+        __half *oh0 = nullptr, *oh1 = nullptr, *oh2 = nullptr;
+        int n_out = 1;
+
+        if (!distinct_inputs) {
+            n0 = lw.attn_norm; o0 = attn_in[0]; oh0 = use_half_dense ? attn_in_h[0] : nullptr; n_out = 1;
+        } else if (v.is_global && !use_prior) {
+            n0 = lw.q_in_norm; n1 = lw.k_in_norm; n2 = lw.v_in_norm;
+            o0 = attn_in[0]; o1 = attn_in[1]; o2 = attn_in[2];
+            oh0 = use_half_dense ? attn_in_h[0] : nullptr;
+            oh1 = use_half_dense ? attn_in_h[1] : nullptr;
+            oh2 = use_half_dense ? attn_in_h[2] : nullptr;
+            n_out = 3;
+        } else if (v.is_global) {
+            o0 = attn_in[0]; o1 = attn_in[1]; o2 = attn_in[2]; n_out = 3;
+        } else {
+            o0 = mlp_in; n_out = 1;
+        }
+
+        if (prev_mlp_pending) {
+            const LayerWeights& prev_lw = mw.layers[schedule[vi - 1].physical_layer];
+            const AblationSlice prev_abl = ablation_slice(lm, true, vi - 1);
+            launch_mega_mlp_post_next_depth_norm(
+                moe_down, false, prev_lw.mlp_sconv_w, mlp_ring[vi - 1],
+                residual, hidden, pre_tap_out, nullptr, partial_dst,
+                blocks, block_count, mw.attn_queries[l - 1],
+                n0, n1, n2, o0, o1, o2, oh0, oh1, oh2, n_out, batch_size, d_pos,
+                prev_abl.r, prev_abl.d, prev_abl.p, stream, d_tok_meta);
+            prev_mlp_pending = false;
+        } else {
+            launch_fused_depth_norm(
+                hidden, partial_dst, blocks, block_count,
+                l > 0 ? mw.attn_queries[l - 1] : nullptr,
+                n0, n1, n2, o0, o1, o2, oh0, oh1, oh2, n_out, batch_size, stream);
+        }
+
+        if (use_prior) {
+            const size_t loc = static_cast<size_t>(l - LOOP_START);
+            float* xs[3] = {
+                v.is_global ? attn_in[0] : mlp_in,
+                v.is_global ? attn_in[1] : mlp_in,
+                v.is_global ? attn_in[2] : mlp_in,
+            };
+            float* outs[3] = {attn_in[0], attn_in[1], attn_in[2]};
+            __half* outs_h[3] = {attn_in_h[0], attn_in_h[1], attn_in_h[2]};
+            const float* cp_q[3] = {
+                mw.cross_pass_queries + (2 * loc) * HIDDEN,
+                mw.cross_pass_kv_queries + (2 * loc) * HIDDEN,
+                mw.cross_pass_kv_queries + (2 * loc + 1) * HIDDEN,
+            };
+            const ControllerWeights* cws[3] = {&lw.ctrl[0], &lw.ctrl[1], &lw.ctrl[2]};
+            const __nv_bfloat16* pnorms[3] = {
+                v.is_global ? lw.q_in_norm : lw.attn_norm,
+                v.is_global ? lw.k_in_norm : lw.attn_norm,
+                v.is_global ? lw.v_in_norm : lw.attn_norm,
+            };
+            if (cws[0]->down_nvfp4.data != nullptr) {
+                launch_controller_nvfp4_batched(
+                    xs, saved, prior_last, cp_q, cws, pnorms, outs, use_half_dense ? outs_h : nullptr,
+                    3, ctrl_msg, reinterpret_cast<__half*>(ctrl_cat), reinterpret_cast<__half*>(ctrl_d),
+                    batch_size, stream);
+            } else {
+                launch_controller_merge_batched(
+                    xs, saved, prior_last, cp_q, cws, pnorms, outs, use_half_dense ? outs_h : nullptr,
+                    3, ctrl_msg, ctrl_cat, ctrl_d, batch_size, stream);
+            }
+        }
+
+        const float* in_q = attn_in[0];
+        const float* in_k = distinct_inputs ? attn_in[1] : attn_in[0];
+        const float* in_v = distinct_inputs ? attn_in[2] : attn_in[0];
+        const __half* in_qh = attn_in_h[0];
+        const __half* in_kh = distinct_inputs ? attn_in_h[1] : attn_in_h[0];
+        const __half* in_vh = distinct_inputs ? attn_in_h[2] : attn_in_h[0];
+
+        if (lw.w_qrgs.kind != WeightKind::BF16) {
+            launch_qkvrg_fused(lw, in_qh, in_kh, in_vh, qrgs, k_proj, v_proj, batch_size, stream);
+        } else {
+            launch_linear(lw.w_qrgs, in_q, qrgs, batch_size, false, stream);
+            launch_linear(lw.w_k, in_k, k_proj, batch_size, false, stream);
+            launch_linear(lw.w_v, in_v, v_proj, batch_size, false, stream);
+        }
+
+        if (v.is_global) {
+            launch_mega_global_sconv_prep_store(
+                qrgs, k_proj, v_proj, in_k, in_v,
+                lw.k_sconv_w, lw.v_sconv_w, lw.k_sconv_proj, lw.v_sconv_proj,
+                k_ring[vi], v_ring[vi], lw.q_clip_scale, lw.rel_clip_scale,
+                k_cache[vi], v_cache[vi], k_scale[vi], v_scale[vi],
+                kv_format, kv_cap[vi], batch_size, d_pos, stream, d_tok_meta, pt_all);
+        } else {
+            launch_mega_local_sconv_prep_store(
+                qrgs, k_proj, v_proj, lw.k_sconv_w, lw.v_sconv_w,
+                k_ring[vi], v_ring[vi], lw.q_clip_scale, lw.rel_clip_scale,
+                static_cast<__nv_bfloat16*>(k_cache[vi]), static_cast<__nv_bfloat16*>(v_cache[vi]),
+                kv_cap[vi], batch_size, d_pos, stream, d_tok_meta);
+        }
+
+        launch_relative_attention_gated_batched(
+            qrgs, lw.rel_logits_proj, k_cache[vi], v_cache[vi], k_scale[vi], v_scale[vi],
+            v.is_global ? kv_format : KVFormat::BF16,
+            split_buf,
+            use_half_dense ? nullptr : attn_gated,
+            use_half_dense ? attn_gated_h : nullptr,
+            kv_cap[vi], v.is_global ? 0 : SWA_WINDOW,
+            batch_size, num_seqs, max_seq_width, d_seq_meta, d_tok_meta,
+            v.is_global ? pt_all : nullptr, stream, ctx_bucket);
+
+        if (use_half_dense) {
+            launch_linear_h(lw.w_o, attn_gated_h, o_proj, batch_size, false, stream);
+        } else {
+            launch_linear(lw.w_o, attn_gated, o_proj, batch_size, false, stream);
+        }
+
+        const bool is_boundary = (l % BLOCK_LAYERS == 0);
+        const AblationSlice attn_abl = ablation_slice(lm, false, vi);
+        launch_mega_attn_post_mlp_in(
+            o_proj, lw.attn_sconv_w, attn_ring[vi], hidden, partial, blocks, block_count,
+            is_boundary, residual, mw.mlp_queries[l],
+            use_prior ? nullptr : lw.mlp_norm,
+            use_prior ? mlp_in : mlp_normed,
+            use_prior ? nullptr : mlp_normed_h,
+            batch_size, d_pos, attn_abl.r, attn_abl.d, attn_abl.p, stream, d_tok_meta);
+        if (is_boundary) block_count += 1;
+
+        if (use_prior) {
+            const size_t loc = static_cast<size_t>(l - LOOP_START);
+            float* xs1[1] = {mlp_in};
+            float* outs1[1] = {mlp_normed};
+            __half* outs_h1[1] = {mlp_normed_h};
+            const float* cp_q1[3] = {mw.cross_pass_queries + (2 * loc + 1) * HIDDEN, nullptr, nullptr};
+            const ControllerWeights* cws1[3] = {&lw.ctrl[3], nullptr, nullptr};
+            const __nv_bfloat16* pnorms1[3] = {lw.mlp_norm, nullptr, nullptr};
+            if (lw.ctrl[3].down_nvfp4.data != nullptr) {
+                launch_controller_nvfp4_batched(
+                    xs1, saved, prior_last, cp_q1, cws1, pnorms1, outs1, outs_h1,
+                    1, ctrl_msg, reinterpret_cast<__half*>(ctrl_cat), reinterpret_cast<__half*>(ctrl_d),
+                    batch_size, stream);
+            } else {
+                launch_controller_merge_batched(
+                    xs1, saved, prior_last, cp_q1, cws1, pnorms1, outs1, outs_h1,
+                    1, ctrl_msg, ctrl_cat, ctrl_d, batch_size, stream);
+            }
+        }
+
+        if (mw.mode == QuantMode::NVFP4) {
+            launch_route_topk_nvfp4(mlp_normed_h, lw.router_nvfp4, lw.router_bias, router_logits, route_ids, route_w, nullptr, nullptr, batch_size, stream);
+        } else {
+            launch_route_topk(mlp_normed, lw.router_w, lw.router_bias, router_logits, route_ids, route_w, nullptr, nullptr, batch_size, stream);
+        }
+        launch_moe_gate_up_h(lw.w13, mlp_normed_h, route_ids, nullptr, moe_act_h, batch_size, stream);
+        launch_moe_down_h(lw.w2, moe_act_h, route_ids, route_w, nullptr, moe_down, batch_size, stream, true);
+
+        if (vi == 17 || vi == 29) {
+            const AblationSlice mlp_abl = ablation_slice(lm, true, vi);
+            launch_mega_mlp_post_res(
+                moe_down, false, lw.mlp_sconv_w, mlp_ring[vi], residual, hidden,
+                batch_size, d_pos, mlp_abl.r, mlp_abl.d, mlp_abl.p, stream, d_tok_meta);
+            prev_mlp_pending = false;
+        } else {
+            prev_mlp_pending = true;
+        }
+    }
+
+    const AblationSlice last_mlp_abl = ablation_slice(lm, true, NUM_VISITS - 1);
+    launch_mega_mlp_post_next_depth_norm(
+        moe_down, false, mw.layers[schedule[NUM_VISITS - 1].physical_layer].mlp_sconv_w,
+        mlp_ring[NUM_VISITS - 1], residual, hidden, nullptr,
+        commit_dspark ? (taps + 3 * b_usize * HIDDEN) : nullptr,
+        nullptr, blocks, block_count, mw.output_query,
+        mw.final_norm, nullptr, nullptr, mlp_normed, nullptr, nullptr,
+        nullptr, nullptr, nullptr, 1, batch_size, d_pos,
+        last_mlp_abl.r, last_mlp_abl.d, last_mlp_abl.p, stream, d_tok_meta);
+
+    const int32_t* ds_pt_all = (kv_pool.total_pages > 0 && ds_kv_cap[1] == static_cast<int>(context_tokens_max)) ? d_page_table : nullptr;
+    if (compute_lm_head) {
+        if (commit_dspark && mw.dspark.loaded) {
+            CUDA_CHECK(cudaEventRecord(fork_event, stream));
+            CUDA_CHECK(cudaStreamWaitEvent(aux_stream, fork_event, 0));
+            launch_dspark_commit(
+                mw.dspark, taps, ds_k_cache, ds_v_cache, ds_k_scale, ds_v_scale, ds_kv_cap,
+                kv_format, ds_f_ring, ds_mix, ds_kv, batch_size, d_pos, aux_stream, d_tok_meta, ds_pt_all);
+            CUDA_CHECK(cudaEventRecord(join_event, aux_stream));
+        }
+        launch_lm_head_argmax(
+            mw.unembed, mlp_normed, d_next_tokens, lm_logits, lm_blk_val, lm_blk_idx,
+            d_sample_cfgs, nullptr,
+            is_verify ? d_batch_draft_tokens : nullptr,
+            is_verify ? d_draft_probs : nullptr,
+            is_verify ? d_draft_q_sel : nullptr,
+            is_verify ? d_draft_is_delta : nullptr,
+            is_verify ? mw.dspark.inv_draft_vocab_ids : nullptr,
+            mw.dspark.draft_vocab_size, batch_size, stream, d_tok_meta);
+        if (commit_dspark && mw.dspark.loaded) {
+            CUDA_CHECK(cudaStreamWaitEvent(stream, join_event, 0));
+        }
+    } else if (commit_dspark && mw.dspark.loaded) {
+        launch_dspark_commit(
+            mw.dspark, taps, ds_k_cache, ds_v_cache, ds_k_scale, ds_v_scale, ds_kv_cap,
+            kv_format, ds_f_ring, ds_mix, ds_kv, batch_size, d_pos, stream, d_tok_meta, ds_pt_all);
+    }
+}
+
+cudaGraphExec_t Engine::get_or_capture_batch_graph(
+    int32_t batch_size, int32_t num_seqs, int32_t max_seq_width, bool commit_dspark, bool is_verify,
+    int32_t ctx_bucket, uint64_t draft_sig, const BatchSlotStepIn* spec_slots) {
+    if (!use_graphs) return nullptr;
+    const int32_t w_bucket = (max_seq_width <= 1) ? 1 : (max_seq_width <= 2) ? 2 : (max_seq_width <= 4) ? 4 : 8;
+    for (size_t i = 0; i < BATCH_GRAPH_CACHE_MAX; ++i) {
+        const auto& e = batch_graphs[i];
+        if (e.valid && e.B == batch_size && e.num_seqs == num_seqs && e.w_bucket == w_bucket &&
+            e.ctx_bucket == ctx_bucket && e.commit_dspark == commit_dspark &&
+            e.is_verify == is_verify && e.draft_sig == draft_sig) {
+            return e.exec;
+        }
+    }
+    size_t free_idx = BATCH_GRAPH_CACHE_MAX;
+    for (size_t i = 0; i < BATCH_GRAPH_CACHE_MAX; ++i) {
+        if (!batch_graphs[i].valid) { free_idx = i; break; }
+    }
+    if (free_idx == BATCH_GRAPH_CACHE_MAX) return nullptr;
+
+    const ModelWeights& mw = model->mw;
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    if (draft_sig != 0 && spec_slots != nullptr) {
+        const __half* ds_ks_const[MTP_LAYERS] = {ds_k_scale[0], ds_k_scale[1], ds_k_scale[2]};
+        const __half* ds_vs_const[MTP_LAYERS] = {ds_v_scale[0], ds_v_scale[1], ds_v_scale[2]};
+        const uint64_t vd = static_cast<uint64_t>(mw.dspark.draft_vocab_size);
+        const bool ds_paged = (kv_pool.total_pages > 0 && ds_kv_cap[1] == static_cast<int>(context_tokens_max));
+        DsparkSlotDraftDesc descs[MAX_DSPARK_SLOTS]{};
+        int n_draft = 0;
+        int32_t b_off = 0;
+        for (int si = 0; si < num_seqs; ++si) {
+            const auto& s = spec_slots[si];
+            const int32_t w = static_cast<int32_t>(1u + s.drafts_k);
+            if (s.drafts_k > 0) {
+                auto& d = descs[n_draft++];
+                d.d_anchor_token = d_slot_anchor + s.slot_id;
+                d.d_pos = d_slot_pos + s.slot_id;
+                d.num_drafts = static_cast<int>(s.drafts_k);
+                for (int ml = 0; ml < MTP_LAYERS; ++ml) {
+                    if (is_mtp_local_layer(ml)) {
+                        d.ctx_k[ml] = static_cast<__nv_bfloat16*>(ds_k_cache[ml]) + static_cast<size_t>(s.slot_id) * ds_kv_cap[ml] * KV_DIM;
+                        d.ctx_v[ml] = static_cast<__nv_bfloat16*>(ds_v_cache[ml]) + static_cast<size_t>(s.slot_id) * ds_kv_cap[ml] * KV_DIM;
+                    } else {
+                        d.ctx_k[ml] = ds_k_cache[ml];
+                        d.ctx_v[ml] = ds_v_cache[ml];
+                    }
+                }
+                d.ds_page_table = ds_paged ? (d_page_table + static_cast<size_t>(s.slot_id) * MAX_KV_PAGES) : nullptr;
+                d.f_ring = ds_f_ring + static_cast<size_t>(s.slot_id) * SCONV_RING_SLOTS * HIDDEN;
+                d.out_draft_tokens = d_slot_drafts + static_cast<size_t>(s.slot_id) * MTP_MAX_DRAFTS;
+                d.sample_cfg = d_sample_cfgs + s.slot_id;
+                d.out_draft_probs = d_draft_probs + static_cast<size_t>(b_off) * vd;
+                d.out_draft_q_sel = d_draft_q_sel + b_off;
+            }
+            b_off += w;
+        }
+        const bool can_batched_ds = (n_draft >= 2 &&
+                                     mw.dspark.layers[0].w_qkv.kind == WeightKind::NVFP4 &&
+                                     mw.dspark.unembed_draft.kind == WeightKind::NVFP4);
+        if (can_batched_ds) {
+            launch_dspark_draft_batched(
+                mw, descs, n_draft, ds_ks_const, ds_vs_const, ds_kv_cap, kv_format,
+                split_buf, ds_ws, d_draft_is_delta, stream);
+        } else {
+            for (int di = 0; di < n_draft; ++di) {
+                const auto& d = descs[di];
+                void* dsk[MTP_LAYERS] = {d.ctx_k[0], d.ctx_k[1], d.ctx_k[2]};
+                void* dsv[MTP_LAYERS] = {d.ctx_v[0], d.ctx_v[1], d.ctx_v[2]};
+                launch_dspark_draft(
+                    mw, d.d_anchor_token, d.d_pos, d.num_drafts,
+                    dsk, dsv, ds_ks_const, ds_vs_const, ds_kv_cap, kv_format,
+                    split_buf, d.f_ring, ds_ws, d.out_draft_tokens, nullptr, 0.0f,
+                    d.sample_cfg, d.out_draft_probs, d.out_draft_q_sel, d_draft_is_delta,
+                    stream, d.ds_page_table);
+            }
+        }
+        launch_assemble_batched_verify_tokens(
+            d_seq_meta, num_seqs, d_slot_anchor, d_slot_drafts, d_tokens, d_batch_draft_tokens, stream);
+    }
+    record_batched_target_forward(batch_size, num_seqs, w_bucket, commit_dspark, true, is_verify, ctx_bucket);
+    cudaGraphExec_t exec = end_capture_and_instantiate(stream);
+    batch_graphs[free_idx] = {true, batch_size, num_seqs, w_bucket, ctx_bucket, commit_dspark, is_verify, draft_sig, exec};
+    return exec;
+}
+
+int32_t Engine::prefill_slot_chunk(
+    int slot_id, const int32_t* prompt_tokens, uint32_t start_pos, uint32_t chunk_len,
+    bool is_final, bool use_mtp, const SampleParams& sp, float* out_first_logits) {
+    SQUID_ASSERT(slot_id >= 0 && static_cast<uint32_t>(slot_id) < max_batch_slots);
+    SQUID_ASSERT(chunk_len > 0);
+    const bool ok_kv = ensure_slot_kv(slot_id, start_pos + chunk_len + 16u);
+    SQUID_ASSERT(ok_kv);
+
+    const bool commit_ds = use_mtp && model->mw.dspark.loaded && static_cast<uint32_t>(slot_id) < max_dspark_slots;
+    uint32_t cur = 0;
+    while (chunk_len - cur >= 32 && (!is_final || (chunk_len - cur) > 32)) {
+        const uint32_t avail = is_final ? (chunk_len - cur - 1) : (chunk_len - cur);
+        const uint32_t sub = std::min(PREFILL_BATCH_MAX, avail & ~7u);
+        if (sub < 32) break;
+        prefill_chunk_batched_slot(slot_id, prompt_tokens + cur, start_pos + cur, sub, commit_ds);
+        cur += sub;
+    }
+
+    if (is_final) {
+        const float inv_t = (sp.temperature >= 1e-4f) ? (1.0f / sp.temperature) : (out_first_logits ? 1.0f : 0.0f);
+        const bool need_logits = (inv_t != 0.0f) || (out_first_logits != nullptr);
+        std::memset(h_batch_io->sample_cfgs, 0, sizeof(h_batch_io->sample_cfgs));
+        h_batch_io->sample_cfgs[slot_id] = {inv_t, sp.top_p, sp.top_k, 0u, sp.seed};
+        h_batch_io->sample_cfgs[0].pad = need_logits ? 1u : 0u;
+        CUDA_CHECK(cudaMemcpyAsync(d_sample_cfgs, h_batch_io->sample_cfgs, sizeof(h_batch_io->sample_cfgs), cudaMemcpyHostToDevice, stream));
+    }
+
+    uint32_t last_batch = 0;
+    while (cur < chunk_len) {
+        const uint32_t b = std::min<uint32_t>(MTP_BLOCK_SIZE, chunk_len - cur);
+        const bool is_last = is_final && (cur + b == chunk_len);
+        const int32_t p0 = static_cast<int32_t>(start_pos + cur);
+        h_batch_io->seq_meta[0] = {slot_id, p0, 0, static_cast<int32_t>(b)};
+        for (uint32_t j = 0; j < b; ++j) {
+            h_batch_io->tokens[j] = prompt_tokens[cur + j];
+            h_batch_io->tok_meta[j] = {slot_id, p0 + static_cast<int32_t>(j), static_cast<int32_t>(j), 0};
+        }
+        CUDA_CHECK(cudaMemcpyAsync(d_tokens, h_batch_io->tokens, b * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_tok_meta, h_batch_io->tok_meta, b * sizeof(BatchTokenMeta), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_seq_meta, h_batch_io->seq_meta, sizeof(BatchSeqMeta), cudaMemcpyHostToDevice, stream));
+        if (is_last && use_graphs) {
+            cudaGraphExec_t exec = get_or_capture_batch_graph(static_cast<int32_t>(b), 1, static_cast<int32_t>(b), commit_ds, false);
+            if (exec) {
+                CUDA_CHECK(cudaGraphLaunch(exec, stream));
+            } else {
+                record_batched_target_forward(static_cast<int32_t>(b), 1, static_cast<int32_t>(b), commit_ds, true, false);
+            }
+        } else {
+            record_batched_target_forward(static_cast<int32_t>(b), 1, static_cast<int32_t>(b), commit_ds, is_last, false);
+        }
+        cur += b;
+        last_batch = b;
+    }
+
+    if (!is_final) return -1;
+
+    int32_t first_tok = 0;
+    CUDA_CHECK(cudaMemcpyAsync(&first_tok, d_next_tokens + (last_batch - 1), sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    if (out_first_logits != nullptr) {
+        CUDA_CHECK(cudaMemcpyAsync(
+            out_first_logits,
+            lm_logits + static_cast<size_t>(last_batch - 1) * VOCAB_UNPADDED,
+            static_cast<size_t>(VOCAB_UNPADDED) * sizeof(float),
+            cudaMemcpyDeviceToHost, stream));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    return first_tok;
+}
+
+void Engine::prefill_multi_slot_chunk(
+    const PrefillSlotChunk* chunks, int num_chunks, int32_t* out_first_tokens) {
+    SQUID_ASSERT(num_chunks >= 1 && num_chunks <= static_cast<int>(max_batch_slots));
+    uint32_t total_B = 0;
+    uint32_t offsets[MAX_BATCH_SLOTS]{};
+    for (int ci = 0; ci < num_chunks; ++ci) {
+        SQUID_ASSERT(chunks[ci].slot_id >= 0 && static_cast<uint32_t>(chunks[ci].slot_id) < max_batch_slots);
+        SQUID_ASSERT(chunks[ci].chunk_len > 0);
+        offsets[ci] = total_B;
+        total_B += chunks[ci].chunk_len;
+        if (out_first_tokens) out_first_tokens[ci] = -1;
+    }
+    SQUID_ASSERT(total_B <= PREFILL_BATCH_MAX);
+
+    // Tiny single-sequence prompt (<= 8 tokens): cached decode graph is faster than cuBLAS FP16 weight dequant
+    if (num_chunks == 1 && total_B <= MTP_BLOCK_SIZE) {
+        const auto& c = chunks[0];
+        const int32_t tok = prefill_slot_chunk(
+            c.slot_id, c.prompt_tokens, c.start_pos, c.chunk_len, c.is_final, c.use_mtp, c.sample);
+        if (out_first_tokens) out_first_tokens[0] = tok;
+        return;
+    }
+
+    const LoadedModel& lm = *model;
+    const ModelWeights& mw = lm.mw;
+    const int b_i32 = static_cast<int>(total_B);
+    const size_t b_usize = total_B;
+
+    int32_t h_tokens[PREFILL_BATCH_MAX];
+    int32_t h_pos_vec[PREFILL_SUB_CHUNKS_MAX];
+    int pos_base[MAX_BATCH_SLOTS]{};
+    int pos_cnt = 0;
+    bool any_ds = false;
+    bool chunk_ds[MAX_BATCH_SLOTS]{};
+
+    for (int ci = 0; ci < num_chunks; ++ci) {
+        const auto& c = chunks[ci];
+        const bool ok_kv = ensure_slot_kv(c.slot_id, c.start_pos + c.chunk_len + 16u);
+        SQUID_ASSERT(ok_kv);
+        std::memcpy(h_tokens + offsets[ci], c.prompt_tokens, static_cast<size_t>(c.chunk_len) * sizeof(int32_t));
+        pos_base[ci] = pos_cnt;
+        for (uint32_t sub = 0; sub < c.chunk_len; sub += PREFILL_LOCAL_ATTN_SUB) {
+            SQUID_ASSERT(pos_cnt < static_cast<int>(PREFILL_SUB_CHUNKS_MAX));
+            h_pos_vec[pos_cnt++] = static_cast<int32_t>(c.start_pos + sub);
+        }
+        chunk_ds[ci] = c.use_mtp && mw.dspark.loaded && static_cast<uint32_t>(c.slot_id) < max_dspark_slots;
+        if (chunk_ds[ci]) any_ds = true;
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync(p_pos_vec, h_pos_vec, static_cast<size_t>(pos_cnt) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(p_tokens, h_tokens, b_usize * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+    launch_embed_norm(mw.embed, mw.embed_norm, p_tokens, p_hidden, b_i32, stream);
+
+    int block_count = 0;
+    bool has_prior = false;
+    bool prev_mlp_pending = false;
+
+    for (int vi = 0; vi < NUM_VISITS; ++vi) {
+        const VisitInfo& v = schedule[vi];
+        const int l = v.physical_layer;
+        const LayerWeights& lw = mw.layers[l];
+
+        bool capture_prelude = false;
+        if (v.is_loop && l == LOOP_START) {
+            if (v.pass == 0) {
+                capture_prelude = true;
+            } else {
+                launch_extract_block(p_blocks, 4, 2, p_saved, b_i32, stream);
+                launch_rmsnorm(p_hidden, nullptr, p_prior_last, b_i32, HIDDEN, HIDDEN, RMS_EPS, stream);
+                CUDA_CHECK(cudaMemcpyAsync(p_hidden, p_prelude, b_usize * HIDDEN * 4, cudaMemcpyDeviceToDevice, stream));
+                block_count = 1;
+                has_prior = true;
+            }
+        }
+        const bool use_prior = v.is_loop && has_prior;
+        const int tap_slot = !any_ds ? -1
+                           : (vi == MTP_TARGET_VISITS[0]) ? 0
+                           : (vi == MTP_TARGET_VISITS[1]) ? 1
+                           : (vi == MTP_TARGET_VISITS[2]) ? 2 : -1;
+        const bool distinct_inputs = v.is_global || use_prior;
+        const bool is_block_start = (l % BLOCK_LAYERS == 0);
+
+        if (prev_mlp_pending) {
+            const LayerWeights& prev_lw = mw.layers[schedule[vi - 1].physical_layer];
+            const AblationSlice abl = ablation_slice(lm, true, vi - 1);
+            for (int ci = 0; ci < num_chunks; ++ci) {
+                const size_t off = offsets[ci];
+                const int len = static_cast<int>(chunks[ci].chunk_len);
+                const size_t h_ring_off = static_cast<size_t>(chunks[ci].slot_id) * SCONV_RING_SLOTS * HIDDEN;
+                launch_prefill_sconv_post_res(
+                    p_moe_slot_out + off * HIDDEN, 0, prev_lw.mlp_sconv_w, mlp_ring[vi - 1] + h_ring_off,
+                    p_residual + off * HIDDEN, p_hidden + off * HIDDEN,
+                    capture_prelude ? (p_prelude + off * HIDDEN) : nullptr,
+                    nullptr, nullptr, 0, 0, len, &p_pos_vec[pos_base[ci]], abl.r, abl.d, abl.p, stream);
+            }
+            if (tap_slot >= 0) {
+                launch_prefill_copy_taps(p_hidden, p_taps, tap_slot, b_i32, stream);
+            }
+        }
+        prev_mlp_pending = false;
+
+        const __nv_bfloat16 *n0 = nullptr, *n1 = nullptr, *n2 = nullptr;
+        float *o0 = nullptr, *o1 = nullptr, *o2 = nullptr;
+        __half *oh0 = nullptr, *oh1 = nullptr, *oh2 = nullptr;
+        int n_out = 1;
+
+        if (!distinct_inputs) {
+            n0 = lw.attn_norm; oh0 = p_attn_in_h[0]; n_out = 1;
+        } else if (v.is_global && !use_prior) {
+            n0 = lw.q_in_norm; n1 = lw.k_in_norm; n2 = lw.v_in_norm;
+            oh0 = p_attn_in_h[0]; oh1 = p_attn_in_h[1]; oh2 = p_attn_in_h[2];
+            n_out = 3;
+        } else if (v.is_global) {
+            o0 = p_attn_in[0]; o1 = p_attn_in[1]; o2 = p_attn_in[2]; n_out = 3;
+        } else {
+            o0 = p_mlp_in; n_out = 1;
+        }
+
+        launch_fused_depth_norm(
+            p_hidden, is_block_start ? p_partial : nullptr, p_blocks, block_count,
+            l > 0 ? mw.attn_queries[l - 1] : nullptr,
+            n0, n1, n2, o0, o1, o2, oh0, oh1, oh2, n_out, b_i32, stream);
+
+        if (use_prior) {
+            const size_t loc = static_cast<size_t>(l - LOOP_START);
+            const float* cp_q[3] = {
+                mw.cross_pass_queries + (2 * loc) * HIDDEN,
+                mw.cross_pass_kv_queries + (2 * loc) * HIDDEN,
+                mw.cross_pass_kv_queries + (2 * loc + 1) * HIDDEN,
+            };
+            const __nv_bfloat16* pnorms[3] = {
+                v.is_global ? lw.q_in_norm : lw.attn_norm,
+                v.is_global ? lw.k_in_norm : lw.attn_norm,
+                v.is_global ? lw.v_in_norm : lw.attn_norm,
+            };
+            for (int cs = 0; cs < 3; ++cs) {
+                const float* x_in = v.is_global ? p_attn_in[cs] : p_mlp_in;
+                launch_prefill_controller_one(
+                    x_in, p_saved, p_prior_last, cp_q[cs], lw.ctrl[cs], pnorms[cs],
+                    nullptr, p_attn_in_h[cs], p_ctrl_msg, p_ctrl_cat_h, p_ctrl_d, p_ctrl_d_h,
+                    p_ctrl_f, p_ctrl_g, p_ctrl_w_f16, b_i32, stream);
+            }
+        }
+
+        const __half* in_qh = p_attn_in_h[0];
+        const __half* in_kh = distinct_inputs ? p_attn_in_h[1] : p_attn_in_h[0];
+        const __half* in_vh = distinct_inputs ? p_attn_in_h[2] : p_attn_in_h[0];
+        launch_prefill_gemm_h(lw.w_qrgs, in_qh, p_qrgs, p_w_f16, b_i32, stream);
+        launch_prefill_gemm_h(lw.w_k, in_kh, p_k_proj, p_w_f16, b_i32, stream);
+        launch_prefill_gemm_h(lw.w_v, in_vh, p_v_proj, p_w_f16, b_i32, stream);
+
+        if (v.is_global) {
+            for (int ci = 0; ci < num_chunks; ++ci) {
+                const size_t off = offsets[ci];
+                const int len = static_cast<int>(chunks[ci].chunk_len);
+                const int sid = chunks[ci].slot_id;
+                const size_t kv_ring_off = static_cast<size_t>(sid) * SCONV_RING_SLOTS * KV_DIM;
+                const int32_t* slot_pt = (kv_pool.total_pages > 0)
+                    ? (d_page_table + static_cast<size_t>(sid) * MAX_KV_PAGES) : nullptr;
+                launch_prefill_global_sconv_prep_store(
+                    p_qrgs + off * QRGS_OUT_DIM, p_k_proj + off * KV_DIM, p_v_proj + off * KV_DIM,
+                    in_kh + off * HIDDEN, in_vh + off * HIDDEN,
+                    lw.k_sconv_w, lw.v_sconv_w, lw.k_sconv_proj, lw.v_sconv_proj,
+                    k_ring[vi] + kv_ring_off, v_ring[vi] + kv_ring_off, lw.q_clip_scale, lw.rel_clip_scale,
+                    k_cache[vi], v_cache[vi], k_scale[vi], v_scale[vi],
+                    kv_format, kv_cap[vi], p_ctrl_d, p_w_f16, len, &p_pos_vec[pos_base[ci]], stream, slot_pt);
+                launch_prefill_flash_attn_tc(
+                    p_qrgs + off * QRGS_OUT_DIM, lw.rel_logits_proj, k_cache[vi], v_cache[vi], k_scale[vi], v_scale[vi],
+                    kv_format, p_attn_gated_h + off * Q_DIM, kv_cap[vi], 0, len, &p_pos_vec[pos_base[ci]], stream, slot_pt);
+            }
+        } else {
+            for (int ci = 0; ci < num_chunks; ++ci) {
+                const size_t base_off = offsets[ci];
+                const uint32_t clen = chunks[ci].chunk_len;
+                const int sid = chunks[ci].slot_id;
+                const size_t kv_ring_off = static_cast<size_t>(sid) * SCONV_RING_SLOTS * KV_DIM;
+                __nv_bfloat16* kc_loc = static_cast<__nv_bfloat16*>(k_cache[vi]) + static_cast<size_t>(sid) * kv_cap[vi] * KV_DIM;
+                __nv_bfloat16* vc_loc = static_cast<__nv_bfloat16*>(v_cache[vi]) + static_cast<size_t>(sid) * kv_cap[vi] * KV_DIM;
+                int sub_idx = 0;
+                for (uint32_t off_u32 = 0; off_u32 < clen; ++sub_idx) {
+                    const uint32_t sub_b = std::min(PREFILL_LOCAL_ATTN_SUB, clen - off_u32);
+                    const size_t off = base_off + off_u32;
+                    const int32_t* d_pos_sub = &p_pos_vec[pos_base[ci] + sub_idx];
+                    float* qrgs_sub = p_qrgs + off * QRGS_OUT_DIM;
+                    float* k_sub = p_k_proj + off * KV_DIM;
+                    float* v_sub = p_v_proj + off * KV_DIM;
+                    launch_prefill_local_sconv_prep_store(
+                        qrgs_sub, k_sub, v_sub, lw.k_sconv_w, lw.v_sconv_w,
+                        k_ring[vi] + kv_ring_off, v_ring[vi] + kv_ring_off, lw.q_clip_scale, lw.rel_clip_scale,
+                        kc_loc, vc_loc, kv_cap[vi], static_cast<int>(sub_b), d_pos_sub, stream);
+                    launch_prefill_flash_attn_tc(
+                        qrgs_sub, lw.rel_logits_proj, kc_loc, vc_loc, nullptr, nullptr,
+                        KVFormat::BF16, p_attn_gated_h + off * Q_DIM,
+                        kv_cap[vi], SWA_WINDOW, static_cast<int>(sub_b), d_pos_sub, stream, nullptr);
+                    off_u32 += sub_b;
+                }
+            }
+        }
+
+        launch_prefill_gemm_h(lw.w_o, p_attn_gated_h, p_o_proj, p_w_f16, b_i32, stream);
+
+        const bool is_boundary = (l % BLOCK_LAYERS == 0);
+        const AblationSlice attn_abl = ablation_slice(lm, false, vi);
+        for (int ci = 0; ci < num_chunks; ++ci) {
+            const size_t off = offsets[ci];
+            const int len = static_cast<int>(chunks[ci].chunk_len);
+            const size_t h_ring_off = static_cast<size_t>(chunks[ci].slot_id) * SCONV_RING_SLOTS * HIDDEN;
+            launch_prefill_sconv_post_res(
+                p_o_proj + off * HIDDEN, 0, lw.attn_sconv_w, attn_ring[vi] + h_ring_off,
+                p_hidden + off * HIDDEN, p_residual + off * HIDDEN, nullptr,
+                p_blocks + off * 4 * HIDDEN, p_partial + off * HIDDEN,
+                block_count, is_boundary ? 1 : 0, len, &p_pos_vec[pos_base[ci]],
+                attn_abl.r, attn_abl.d, attn_abl.p, stream);
+        }
+        if (is_boundary) block_count += 1;
+
+        launch_fused_depth_norm(
+            p_residual, nullptr, p_blocks, block_count, mw.mlp_queries[l],
+            use_prior ? nullptr : lw.mlp_norm, nullptr, nullptr,
+            use_prior ? p_mlp_in : nullptr, nullptr, nullptr,
+            use_prior ? nullptr : p_mlp_normed_h, nullptr, nullptr,
+            1, b_i32, stream);
+
+        if (use_prior) {
+            const size_t loc = static_cast<size_t>(l - LOOP_START);
+            launch_prefill_controller_one(
+                p_mlp_in, p_saved, p_prior_last, mw.cross_pass_queries + (2 * loc + 1) * HIDDEN,
+                lw.ctrl[3], lw.mlp_norm, nullptr, p_mlp_normed_h,
+                p_ctrl_msg, p_ctrl_cat_h, p_ctrl_d, p_ctrl_d_h, p_ctrl_f, p_ctrl_g, p_ctrl_w_f16,
+                b_i32, stream);
+        }
+
+        LinearWeight router_lw{};
+        if (mw.mode == QuantMode::NVFP4) {
+            router_lw = lw.router_nvfp4;
+        } else {
+            router_lw.kind = WeightKind::BF16;
+            router_lw.rows = NUM_EXPERTS;
+            router_lw.cols = HIDDEN;
+            router_lw.data = lw.router_w;
+        }
+        launch_prefill_gemm_h(router_lw, p_mlp_normed_h, p_router_logits, p_w_f16, b_i32, stream);
+        launch_prefill_route_and_sort(
+            p_router_logits, lw.router_bias, p_route_ids, p_route_w,
+            p_exp_offsets, p_sorted_tok, p_sorted_slot, p_sorted_w, b_i32, stream);
+        launch_prefill_moe_gate_up_h(lw.w13, p_mlp_normed_h, p_exp_offsets, p_sorted_tok, p_sorted_slot, p_moe_act_h, b_i32, stream);
+        launch_prefill_moe_down_h(lw.w2, p_moe_act_h, p_exp_offsets, p_sorted_tok, p_sorted_slot, p_sorted_w, p_moe_slot_out, b_i32, stream);
+
+        if (vi == 17 || vi == 29) {
+            const AblationSlice mlp_abl = ablation_slice(lm, true, vi);
+            for (int ci = 0; ci < num_chunks; ++ci) {
+                const size_t off = offsets[ci];
+                const int len = static_cast<int>(chunks[ci].chunk_len);
+                const size_t h_ring_off = static_cast<size_t>(chunks[ci].slot_id) * SCONV_RING_SLOTS * HIDDEN;
+                launch_prefill_sconv_post_res(
+                    p_moe_slot_out + off * HIDDEN, 0, lw.mlp_sconv_w, mlp_ring[vi] + h_ring_off,
+                    p_residual + off * HIDDEN, p_hidden + off * HIDDEN, nullptr,
+                    nullptr, nullptr, 0, 0, len, &p_pos_vec[pos_base[ci]], mlp_abl.r, mlp_abl.d, mlp_abl.p, stream);
+            }
+            prev_mlp_pending = false;
+        } else {
+            prev_mlp_pending = true;
+        }
+    }
+
+    const LayerWeights& last_lw = mw.layers[schedule[NUM_VISITS - 1].physical_layer];
+    const AblationSlice last_mlp_abl = ablation_slice(lm, true, NUM_VISITS - 1);
+    for (int ci = 0; ci < num_chunks; ++ci) {
+        const size_t off = offsets[ci];
+        const int len = static_cast<int>(chunks[ci].chunk_len);
+        const size_t h_ring_off = static_cast<size_t>(chunks[ci].slot_id) * SCONV_RING_SLOTS * HIDDEN;
+        launch_prefill_sconv_post_res(
+            p_moe_slot_out + off * HIDDEN, 0, last_lw.mlp_sconv_w, mlp_ring[NUM_VISITS - 1] + h_ring_off,
+            p_residual + off * HIDDEN, p_hidden + off * HIDDEN, nullptr,
+            nullptr, nullptr, 0, 0, len, &p_pos_vec[pos_base[ci]], last_mlp_abl.r, last_mlp_abl.d, last_mlp_abl.p, stream);
+    }
+    launch_fused_depth_norm(
+        p_hidden, nullptr, p_blocks, block_count, mw.output_query,
+        mw.final_norm, nullptr, nullptr, p_mlp_normed, nullptr, nullptr,
+        nullptr, nullptr, nullptr, 1, b_i32, stream);
+
+    // Gather final-token hidden states BEFORE DSpark commit overwrites p_attn_in_h[0] (which aliases p_mlp_normed!)
+    int final_chunks[MAX_BATCH_SLOTS];
+    int n_final = 0;
+    bool any_stoch = false;
+    std::memset(h_batch_io->sample_cfgs, 0, sizeof(h_batch_io->sample_cfgs));
+    for (int ci = 0; ci < num_chunks; ++ci) {
+        if (!chunks[ci].is_final) continue;
+        const auto& c = chunks[ci];
+        const size_t last_idx = static_cast<size_t>(offsets[ci] + c.chunk_len - 1u);
+        CUDA_CHECK(cudaMemcpyAsync(
+            mlp_normed + static_cast<size_t>(n_final) * HIDDEN,
+            p_mlp_normed + last_idx * HIDDEN,
+            static_cast<size_t>(HIDDEN) * sizeof(float),
+            cudaMemcpyDeviceToDevice, stream));
+        const float inv_t = (c.sample.temperature >= 1e-4f) ? (1.0f / c.sample.temperature) : 0.0f;
+        if (inv_t > 0.0f) any_stoch = true;
+        h_batch_io->sample_cfgs[c.slot_id] = {inv_t, c.sample.top_p, c.sample.top_k, 0u, c.sample.seed};
+        h_batch_io->tok_meta[n_final] = {c.slot_id, static_cast<int32_t>(c.start_pos + c.chunk_len - 1u), 0, n_final};
+        final_chunks[n_final++] = ci;
+    }
+
+    if (any_ds) {
+        launch_prefill_copy_taps(p_mlp_normed, p_taps, 3, b_i32, stream);
+        for (int ci = 0; ci < num_chunks; ++ci) {
+            if (!chunk_ds[ci]) continue;
+            const int sid = chunks[ci].slot_id;
+            const int len = static_cast<int>(chunks[ci].chunk_len);
+            const size_t h_ring_off = static_cast<size_t>(sid) * SCONV_RING_SLOTS * HIDDEN;
+            void* dsk[MTP_LAYERS];
+            void* dsv[MTP_LAYERS];
+            for (int ml = 0; ml < MTP_LAYERS; ++ml) {
+                if (is_mtp_local_layer(ml)) {
+                    dsk[ml] = static_cast<__nv_bfloat16*>(ds_k_cache[ml]) + static_cast<size_t>(sid) * ds_kv_cap[ml] * KV_DIM;
+                    dsv[ml] = static_cast<__nv_bfloat16*>(ds_v_cache[ml]) + static_cast<size_t>(sid) * ds_kv_cap[ml] * KV_DIM;
+                } else {
+                    dsk[ml] = ds_k_cache[ml];
+                    dsv[ml] = ds_v_cache[ml];
+                }
+            }
+            const int32_t* slot_pt = (kv_pool.total_pages > 0)
+                ? (d_page_table + static_cast<size_t>(sid) * MAX_KV_PAGES) : nullptr;
+            const int32_t* ds_pt = (kv_pool.total_pages > 0 && ds_kv_cap[1] == static_cast<int>(context_tokens_max)) ? slot_pt : nullptr;
+            launch_prefill_dspark_commit(
+                mw.dspark, p_taps, dsk, dsv, ds_k_scale, ds_v_scale, ds_kv_cap,
+                kv_format, ds_f_ring + h_ring_off, p_attn_in_h[0], p_qrgs, p_w_f16,
+                len, &p_pos_vec[pos_base[ci]], stream, ds_pt, b_i32, static_cast<int>(offsets[ci]));
+        }
+    }
+
+    if (n_final == 0) return;
+
+    h_batch_io->sample_cfgs[0].pad = any_stoch ? 1u : 0u;
+    CUDA_CHECK(cudaMemcpyAsync(d_sample_cfgs, h_batch_io->sample_cfgs, sizeof(h_batch_io->sample_cfgs), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_tok_meta, h_batch_io->tok_meta, static_cast<size_t>(n_final) * sizeof(BatchTokenMeta), cudaMemcpyHostToDevice, stream));
+    launch_lm_head_argmax(
+        mw.unembed, mlp_normed, d_next_tokens, lm_logits, lm_blk_val, lm_blk_idx,
+        d_sample_cfgs, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        mw.dspark.draft_vocab_size, n_final, stream, d_tok_meta);
+    CUDA_CHECK(cudaMemcpyAsync(h_batch_io->next_tokens, d_next_tokens, static_cast<size_t>(n_final) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (out_first_tokens) {
+        for (int fi = 0; fi < n_final; ++fi) {
+            out_first_tokens[final_chunks[fi]] = h_batch_io->next_tokens[fi];
+        }
+    }
+}
+
+SingleAdaptiveStepOut Engine::step_single_adaptive_slot0(
+    int32_t pos, int32_t anchor, uint32_t max_rem,
+    const SampleParams& sp, PromptLookupIndex* lookup,
+    bool* draft_in_flight, bool* sample_cfg_uploaded) {
+    SingleAdaptiveStepOut out{};
+    const bool ok_kv = ensure_slot_kv(0, static_cast<uint32_t>(pos) + MTP_BLOCK_SIZE + 8u);
+    SQUID_ASSERT(ok_kv);
+
+    if (!*sample_cfg_uploaded) {
+        const float inv_t = (sp.temperature >= 1e-4f) ? (1.0f / sp.temperature) : 0.0f;
+        const SampleConfig cfg_h{inv_t, sp.top_p, sp.top_k, 0u, sp.seed};
+        CUDA_CHECK(cudaMemcpyAsync(d_sample_cfg, &cfg_h, sizeof(SampleConfig), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_pos, &pos, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_anchor, &anchor, sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        ensure_adaptive_graphs();
+        *sample_cfg_uploaded = true;
+    }
+
+    bool lookup_hit = false;
+    if (use_prompt_lookup && lookup != nullptr && lookup->match(h_lookup_draft->tokens)) {
+        lookup_hit = true;
+        CUDA_CHECK(cudaMemcpyAsync(d_lookup_draft, h_lookup_draft, sizeof(LookupDraft), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaGraphLaunch(verify_b8_graph_exec, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        *draft_in_flight = false;
+    }
+    if (!lookup_hit) {
+        if (!*draft_in_flight) {
+            CUDA_CHECK(cudaGraphLaunch(draft_graph_exec, stream));
+        }
+        CUDA_CHECK(adaptive_graph_launch(adaptive_graph, stream));
+        CUDA_CHECK(cudaEventRecord(done_event, stream));
+        const bool next_draft = (max_rem > 1) && (static_cast<uint32_t>(pos) + 2u * MTP_BLOCK_SIZE < context_tokens_max);
+        // Ensure pages for the speculative next draft won't exceed allocated pages before launching it
+        if (next_draft && ensure_slot_kv(0, static_cast<uint32_t>(pos) + 2u * MTP_BLOCK_SIZE + 8u)) {
+            CUDA_CHECK(cudaGraphLaunch(draft_graph_exec, stream));
+            *draft_in_flight = true;
+        } else {
+            *draft_in_flight = false;
+        }
+        CUDA_CHECK(cudaEventSynchronize(done_event));
+    }
+
+    const int32_t n_acc_i32 = h_decode_result->accepted_count;
+    const int32_t chosen_w = lookup_hit ? MTP_BLOCK_SIZE : h_decode_result->verify_width;
+    SQUID_ASSERT(n_acc_i32 >= 1 && n_acc_i32 <= chosen_w);
+    out.count = static_cast<uint32_t>(n_acc_i32);
+    out.drafts = static_cast<uint32_t>(chosen_w - 1);
+    out.accepted = static_cast<uint32_t>(n_acc_i32 - 1);
+    out.used_lookup = lookup_hit;
+    for (uint32_t i = 0; i < out.count; ++i) out.tokens[i] = h_decode_result->tokens[i];
+    return out;
+}
+
+void Engine::sync_stream_for_batch() {
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+void Engine::step_batch_decode(
+    const BatchSlotStepIn* slots, int num_seqs, bool commit_dspark_when_k0, BatchSlotStepOut* out) {
+    SQUID_ASSERT(num_seqs >= 1 && num_seqs <= static_cast<int>(max_batch_slots));
+    const ModelWeights& mw = model->mw;
+
+    int32_t total_B = 0;
+    int32_t max_w = 1;
+    int32_t max_end = 0;
+    bool any_spec = false;
+    bool any_stochastic = false;
+    bool any_ds_commit = false;
+
+    std::memset(h_batch_io->sample_cfgs, 0, sizeof(h_batch_io->sample_cfgs));
+
+    for (int si = 0; si < num_seqs; ++si) {
+        const auto& s = slots[si];
+        const int32_t w = static_cast<int32_t>(1u + s.drafts_k);
+        SQUID_ASSERT(total_B + w <= MTP_BLOCK_SIZE);
+        const bool ok_kv = ensure_slot_kv(s.slot_id, static_cast<uint32_t>(s.pos + w) + 8u);
+        SQUID_ASSERT(ok_kv);
+
+        if (s.drafts_k > 0) any_spec = true;
+        if (w > max_w) max_w = w;
+        if (s.pos + w > max_end) max_end = s.pos + w;
+        const float inv_t = (s.sample.temperature >= 1e-4f) ? (1.0f / s.sample.temperature) : 0.0f;
+        if (inv_t > 0.0f) any_stochastic = true;
+        if (s.use_mtp && mw.dspark.loaded && static_cast<uint32_t>(s.slot_id) < max_dspark_slots) {
+            any_ds_commit = true;
+        }
+
+        h_batch_io->sample_cfgs[s.slot_id] = {inv_t, s.sample.top_p, s.sample.top_k, 0u, s.sample.seed};
+        h_batch_io->slot_pos[s.slot_id] = s.pos;
+        h_batch_io->slot_anchor[s.slot_id] = s.anchor;
+        h_batch_io->seq_meta[si] = {s.slot_id, s.pos, total_B, w};
+        for (int32_t j = 0; j < w; ++j) {
+            h_batch_io->tok_meta[total_B + j] = {s.slot_id, s.pos + j, j, si};
+            h_batch_io->tokens[total_B + j] = (j == 0) ? s.anchor : 0;
+        }
+        total_B += w;
+    }
+    h_batch_io->sample_cfgs[0].pad = any_stochastic ? 1u : 0u;
+
+    CUDA_CHECK(cudaMemcpyAsync(d_tok_meta, h_batch_io->tok_meta, static_cast<size_t>(total_B) * sizeof(BatchTokenMeta), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_seq_meta, h_batch_io->seq_meta, static_cast<size_t>(num_seqs) * sizeof(BatchSeqMeta), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(d_sample_cfgs, h_batch_io->sample_cfgs, sizeof(h_batch_io->sample_cfgs), cudaMemcpyHostToDevice, stream));
+
+    const int32_t ctx_bucket = (max_end <= 256) ? 0 : (max_end <= REL_EXTENT) ? 1 : 2;
+
+    if (any_spec) {
+        CUDA_CHECK(cudaMemcpyAsync(d_slot_pos, h_batch_io->slot_pos, sizeof(h_batch_io->slot_pos), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_slot_anchor, h_batch_io->slot_anchor, sizeof(h_batch_io->slot_anchor), cudaMemcpyHostToDevice, stream));
+
+        // Pack drafting topology into a 64-bit signature so draft + assemble + verify target run in ONE CUDA Graph!
+        uint64_t draft_sig = 0;
+        int d_cnt = 0;
+        for (int si = 0; si < num_seqs; ++si) {
+            const auto& s = slots[si];
+            if (s.drafts_k == 0) continue;
+            SQUID_ASSERT(static_cast<uint32_t>(s.slot_id) < max_dspark_slots);
+            SQUID_ASSERT(d_cnt < MAX_DSPARK_SLOTS);
+            const uint64_t b_off = static_cast<uint64_t>(h_batch_io->seq_meta[si].batch_off) & 15ull;
+            const uint64_t entry = (static_cast<uint64_t>(s.slot_id) << 8) |
+                                   (static_cast<uint64_t>(s.drafts_k) << 4) | b_off;
+            draft_sig |= (entry << (12 * d_cnt));
+            ++d_cnt;
+        }
+        draft_sig |= (static_cast<uint64_t>(d_cnt) << 56);
+
+        cudaGraphExec_t exec = get_or_capture_batch_graph(
+            total_B, num_seqs, max_w, /*commit_dspark=*/true, /*is_verify=*/true, ctx_bucket, draft_sig, slots);
+        if (exec) {
+            CUDA_CHECK(cudaGraphLaunch(exec, stream));
+        } else {
+            const __half* ds_ks_const[MTP_LAYERS] = {ds_k_scale[0], ds_k_scale[1], ds_k_scale[2]};
+            const __half* ds_vs_const[MTP_LAYERS] = {ds_v_scale[0], ds_v_scale[1], ds_v_scale[2]};
+            const uint64_t vd = static_cast<uint64_t>(mw.dspark.draft_vocab_size);
+            const bool ds_paged = (kv_pool.total_pages > 0 && ds_kv_cap[1] == static_cast<int>(context_tokens_max));
+            DsparkSlotDraftDesc descs[MAX_DSPARK_SLOTS]{};
+            int n_draft = 0;
+            for (int si = 0; si < num_seqs; ++si) {
+                const auto& s = slots[si];
+                if (s.drafts_k == 0) continue;
+                auto& d = descs[n_draft++];
+                d.d_anchor_token = d_slot_anchor + s.slot_id;
+                d.d_pos = d_slot_pos + s.slot_id;
+                d.num_drafts = static_cast<int>(s.drafts_k);
+                for (int ml = 0; ml < MTP_LAYERS; ++ml) {
+                    if (is_mtp_local_layer(ml)) {
+                        d.ctx_k[ml] = static_cast<__nv_bfloat16*>(ds_k_cache[ml]) + static_cast<size_t>(s.slot_id) * ds_kv_cap[ml] * KV_DIM;
+                        d.ctx_v[ml] = static_cast<__nv_bfloat16*>(ds_v_cache[ml]) + static_cast<size_t>(s.slot_id) * ds_kv_cap[ml] * KV_DIM;
+                    } else {
+                        d.ctx_k[ml] = ds_k_cache[ml];
+                        d.ctx_v[ml] = ds_v_cache[ml];
+                    }
+                }
+                const int32_t b_off = h_batch_io->seq_meta[si].batch_off;
+                d.ds_page_table = ds_paged ? (d_page_table + static_cast<size_t>(s.slot_id) * MAX_KV_PAGES) : nullptr;
+                d.f_ring = ds_f_ring + static_cast<size_t>(s.slot_id) * SCONV_RING_SLOTS * HIDDEN;
+                d.out_draft_tokens = d_slot_drafts + static_cast<size_t>(s.slot_id) * MTP_MAX_DRAFTS;
+                d.sample_cfg = d_sample_cfgs + s.slot_id;
+                d.out_draft_probs = d_draft_probs + static_cast<size_t>(b_off) * vd;
+                d.out_draft_q_sel = d_draft_q_sel + b_off;
+            }
+            if (n_draft >= 2 && mw.dspark.layers[0].w_qkv.kind == WeightKind::NVFP4 && mw.dspark.unembed_draft.kind == WeightKind::NVFP4) {
+                launch_dspark_draft_batched(
+                    mw, descs, n_draft, ds_ks_const, ds_vs_const, ds_kv_cap, kv_format,
+                    split_buf, ds_ws, d_draft_is_delta, stream);
+            } else {
+                for (int di = 0; di < n_draft; ++di) {
+                    const auto& d = descs[di];
+                    void* dsk[MTP_LAYERS] = {d.ctx_k[0], d.ctx_k[1], d.ctx_k[2]};
+                    void* dsv[MTP_LAYERS] = {d.ctx_v[0], d.ctx_v[1], d.ctx_v[2]};
+                    launch_dspark_draft(
+                        mw, d.d_anchor_token, d.d_pos, d.num_drafts,
+                        dsk, dsv, ds_ks_const, ds_vs_const, ds_kv_cap, kv_format,
+                        split_buf, d.f_ring, ds_ws, d.out_draft_tokens, nullptr, 0.0f,
+                        d.sample_cfg, d.out_draft_probs, d.out_draft_q_sel, d_draft_is_delta,
+                        stream, d.ds_page_table);
+                }
+            }
+            launch_assemble_batched_verify_tokens(
+                d_seq_meta, num_seqs, d_slot_anchor, d_slot_drafts, d_tokens, d_batch_draft_tokens, stream);
+            record_batched_target_forward(total_B, num_seqs, max_w, true, true, true, ctx_bucket);
+        }
+
+        CUDA_CHECK(cudaMemcpyAsync(h_batch_io->next_tokens, d_next_tokens, static_cast<size_t>(total_B) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_batch_io->draft_tokens, d_batch_draft_tokens, static_cast<size_t>(total_B) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        for (int si = 0; si < num_seqs; ++si) {
+            const int32_t b_off = h_batch_io->seq_meta[si].batch_off;
+            const int32_t w = h_batch_io->seq_meta[si].width;
+            BatchSlotStepOut& res = out[si];
+            res.count = 0;
+            res.drafts = static_cast<uint32_t>(w - 1);
+            res.accepted = 0;
+            bool all_ok = true;
+            for (int32_t j = 0; j < w - 1; ++j) {
+                const int32_t tp = h_batch_io->next_tokens[b_off + j];
+                res.tokens[res.count++] = tp;
+                if (tp != h_batch_io->draft_tokens[b_off + j]) {
+                    all_ok = false;
+                    break;
+                }
+                res.accepted += 1;
+            }
+            if (all_ok) {
+                res.tokens[res.count++] = h_batch_io->next_tokens[b_off + w - 1];
+            }
+        }
+        return;
+    }
+
+    // Pure continuous batching step (all drafts_k == 0, total_B == num_seqs, max_w == 1)
+    const bool commit_ds = commit_dspark_when_k0 && any_ds_commit;
+    CUDA_CHECK(cudaMemcpyAsync(d_tokens, h_batch_io->tokens, static_cast<size_t>(total_B) * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    cudaGraphExec_t exec = get_or_capture_batch_graph(total_B, num_seqs, 1, commit_ds, /*is_verify=*/false, ctx_bucket);
+    if (exec) {
+        CUDA_CHECK(cudaGraphLaunch(exec, stream));
+    } else {
+        record_batched_target_forward(total_B, num_seqs, 1, commit_ds, true, false, ctx_bucket);
+    }
+    CUDA_CHECK(cudaMemcpyAsync(h_batch_io->next_tokens, d_next_tokens, static_cast<size_t>(total_B) * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    for (int si = 0; si < num_seqs; ++si) {
+        out[si].tokens[0] = h_batch_io->next_tokens[si];
+        out[si].count = 1;
+        out[si].drafts = 0;
+        out[si].accepted = 0;
+    }
 }
 
 } // namespace squid

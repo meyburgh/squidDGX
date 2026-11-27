@@ -50,16 +50,17 @@ void launch_lm_head_argmax(
     float* out_logits,                   // optional [B, VOCAB_UNPADDED]
     float* scratch_vals,                 // [B, 1024]
     int32_t* scratch_idxs,               // [B, 1024]
-    const SampleConfig* sample_cfg,      // optional device pointer
+    const SampleConfig* sample_cfg,      // optional device pointer (or [MAX_BATCH_SLOTS] when tok_meta != nullptr)
     const int32_t* d_pos,                // optional device pointer (batch start pos)
-    const int32_t* d_draft_tokens,       // optional [B-1] for rejection sampling
-    const float* d_draft_probs,          // optional [B-1, draft_vocab_size] normalized q_b(v)
-    const float* d_draft_q_sel,          // optional [B-1] q_b(draft_tokens[b])
+    const int32_t* d_draft_tokens,       // optional [B-1] (or [B] with -1 sentinel when tok_meta != nullptr)
+    const float* d_draft_probs,          // optional [B-1 or B, draft_vocab_size] normalized q_b(v)
+    const float* d_draft_q_sel,          // optional [B-1 or B] q_b(draft_tokens[b])
     const int32_t* d_draft_is_delta,     // optional [1] non-zero when prompt-lookup (q = delta_x)
     const int32_t* inv_draft_vocab,      // optional [VOCAB_UNPADDED] real->draft idx (-1 if absent)
     int draft_vocab_size,
     int B,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const BatchTokenMeta* tok_meta = nullptr);
 
 // Build deduplicated expert groups for B tokens (B = 2..8)
 void launch_build_expert_groups(
@@ -239,13 +240,39 @@ void launch_relative_attention_gated(
     const __half* k_scale,              // optional: FP8 [cap, 8], Q4 [cap, 16]
     const __half* v_scale,              // optional: FP8 [cap, 8], Q4 [cap, 16]
     KVFormat kv_fmt,
-    float* split_buf,                   // [600000] floats scratch for global Split-K partials
+    float* split_buf,                   // [SPLIT_BUFFER_FLOATS] floats scratch for global Split-K partials
     float* out_gated,                   // [B, 3072]
     __half* out_gated_h,                // optional [B, 3072]
     int kv_cap,
     int window,                         // 1024 for local, 0 for global
     int B, const int32_t* d_pos,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const int32_t* page_table = nullptr);
+
+// Multi-sequence batched Relative Attention (continuous batching, paged global KV + per-slot local SWA):
+// Processes `num_seqs` independent sequences (total `B` tokens, each sequence up to `max_seq_width` tokens)
+// in parallel across a 3D grid!
+void launch_relative_attention_gated_batched(
+    const float* qrgs,                  // [B, 6552]
+    const __nv_bfloat16* rel_proj,      // [16, 1024]
+    const void* k_cache,
+    const void* v_cache,
+    const __half* k_scale,
+    const __half* v_scale,
+    KVFormat kv_fmt,
+    float* split_buf,
+    float* out_gated,
+    __half* out_gated_h,
+    int kv_cap,
+    int window,                         // 1024 for local (slot-strided), 0 for global (paged)
+    int B,
+    int num_seqs,
+    int max_seq_width,
+    const BatchSeqMeta* d_seq_meta,
+    const BatchTokenMeta* d_tok_meta,
+    const int32_t* d_page_table,        // [MAX_BATCH_SLOTS * MAX_KV_PAGES] when window == 0
+    cudaStream_t stream,
+    int ctx_bucket = 2);
 
 // 64-block parallel half-warp NVFP4 MoE Router + Fused Top-8 & ExpertGroups + Free moe_down zeroing!
 void launch_route_topk_nvfp4(
@@ -326,7 +353,9 @@ void launch_mega_global_sconv_prep_store(
     KVFormat kv_fmt,
     int kv_cap,
     int B, const int32_t* d_pos,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const BatchTokenMeta* tok_meta = nullptr,
+    const int32_t* page_table = nullptr);
 
 // MEGA-FUSION 5: Fuses mlp_post_res(vi-1) [with optional deterministic 8-slot reduction!] + pre_tap + next attn_in_depth_norm(vi) (+ post_tap)!
 void launch_mega_mlp_post_next_depth_norm(
@@ -357,7 +386,8 @@ void launch_mega_mlp_post_next_depth_norm(
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const BatchTokenMeta* tok_meta = nullptr);
 
 // MEGA-FUSION 2: Local-layer fused k_sconv + v_sconv + Q/R/K clip + V norm + KV cache store (replaces 3 kernels!)
 void launch_mega_local_sconv_prep_store(
@@ -374,7 +404,8 @@ void launch_mega_local_sconv_prep_store(
     __nv_bfloat16* v_cache,
     int kv_cap,
     int B, const int32_t* d_pos,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const BatchTokenMeta* tok_meta = nullptr);
 
 // MEGA-FUSION 3: attn_sconv + residual/block-boundary + mlp_depth_attn + optional mlp_norm (+ half!) (replaces 4 kernels!)
 void launch_mega_attn_post_mlp_in(
@@ -395,7 +426,8 @@ void launch_mega_attn_post_mlp_in(
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const BatchTokenMeta* tok_meta = nullptr);
 
 // MEGA-FUSION 4: mlp_sconv + residual add -> hidden (supports deterministic 8-slot reduction when B>1!)
 void launch_mega_mlp_post_res(
@@ -409,7 +441,8 @@ void launch_mega_mlp_post_res(
     const float* abl_r,
     const float* abl_d,
     const float* abl_p,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const BatchTokenMeta* tok_meta = nullptr);
 
 // Simple vector ops
 void launch_vec_add(const float* a, const float* b, float* out, int n, cudaStream_t stream);
@@ -418,7 +451,7 @@ void launch_extract_block(const float* blocks, int max_blocks, int slot_idx, flo
 
 // --- DSpark MTP Speculative Decoding Kernels (kernels_dspark.cu) ---
 
-// Commit target taps [B, 4, HIDDEN] for positions d_pos..d_pos+B-1 into DSpark context KV caches & markov f-ring
+// Commit target taps [B, 4, HIDDEN] for positions d_pos..d_pos+B-1 (or per-row tok_meta) into DSpark context KV caches & markov f-ring
 void launch_dspark_commit(
     const DsparkWeights& dw,
     const float* taps,          // [4, B, HIDDEN] (4 tap slots, each [B, HIDDEN])
@@ -428,11 +461,13 @@ void launch_dspark_commit(
     __half* ctx_vs[MTP_LAYERS],
     int ctx_cap[MTP_LAYERS],
     KVFormat global_kv_fmt,
-    float* f_ring,              // [16, HIDDEN] ring buffer of markov context f
+    float* f_ring,              // [16, HIDDEN] (or [MAX_DSPARK_SLOTS * 16, HIDDEN] when tok_meta != nullptr)
     float* scratch_mix,         // [4, B, HIDDEN]
     float* scratch_kv,          // [B, 2*KV_DIM]
     int B, const int32_t* d_pos,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const BatchTokenMeta* tok_meta = nullptr,
+    const int32_t* ds_page_table = nullptr);
 
 // Run DSpark 3-layer block forward (anchor + 7 masks = 8 rows) + 7-step Markov RNN head on GPU!
 // Writes draft_tokens[0..num_drafts-1] directly on device!
@@ -447,7 +482,7 @@ void launch_dspark_draft(
     const __half* ctx_vs[MTP_LAYERS],
     int ctx_cap[MTP_LAYERS],
     KVFormat global_kv_fmt,
-    float* split_buf,              // [600000] floats scratch for global Split-K
+    float* split_buf,              // [SPLIT_BUFFER_FLOATS] floats scratch for global Split-K
     const float* f_ring,           // [16, HIDDEN], reads (pos - 1) & 15
     float* workspace,              // preallocated workspace for DSpark block & Markov head
     int32_t* out_draft_tokens,     // [num_drafts]
@@ -457,6 +492,36 @@ void launch_dspark_draft(
     float* out_draft_probs,        // optional [num_drafts, draft_vocab_size] normalized q_i(v)
     float* out_draft_q_sel,        // optional [num_drafts] q_i(out_draft_tokens[i])
     int32_t* out_draft_is_delta,   // optional [1] cleared to 0 by DSpark
+    cudaStream_t stream,
+    const int32_t* ds_page_table = nullptr);
+
+struct DsparkSlotDraftDesc {
+    const int32_t* d_anchor_token;
+    const int32_t* d_pos;
+    int num_drafts;
+    void* ctx_k[MTP_LAYERS];
+    void* ctx_v[MTP_LAYERS];
+    const int32_t* ds_page_table;
+    const float* f_ring;
+    int32_t* out_draft_tokens;
+    const SampleConfig* sample_cfg;
+    float* out_draft_probs;
+    float* out_draft_q_sel;
+};
+
+// Batched multi-slot DSpark draft (2..4 slots, total_drafts <= 7):
+// Loads DSpark's 3 layers + unembed_draft (259 MB) ONCE across all active drafting slots!
+void launch_dspark_draft_batched(
+    const ModelWeights& mw,
+    const DsparkSlotDraftDesc* slots,
+    int n_slots,
+    const __half* ctx_ks[MTP_LAYERS],
+    const __half* ctx_vs[MTP_LAYERS],
+    int ctx_cap[MTP_LAYERS],
+    KVFormat global_kv_fmt,
+    float* split_buf,
+    float* workspace,
+    int32_t* out_draft_is_delta,
     cudaStream_t stream);
 
 // GPU verification kernel: compares target's predicted tokens [B] against draft tokens [B-1],
@@ -525,7 +590,10 @@ void launch_prefill_dspark_commit(
     __half* w_f16_scratch,
     int B,
     const int32_t* d_pos,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const int32_t* ds_page_table = nullptr,
+    int tap_stride = -1,
+    int tap_offset = 0);
 
 void launch_prefill_local_sconv_prep_store(
     float* qrgs,
@@ -568,7 +636,8 @@ void launch_prefill_global_sconv_prep_store(
     __half* w_f16_scratch,
     int B,
     const int32_t* d_pos,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const int32_t* page_table = nullptr);
 
 void launch_prefill_flash_attn_tc(
     const float* qrgs,
@@ -583,7 +652,8 @@ void launch_prefill_flash_attn_tc(
     int window,
     int B,
     const int32_t* d_pos,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    const int32_t* page_table = nullptr);
 
 void launch_prefill_controller_one(
     const float* x,
@@ -712,6 +782,15 @@ void launch_assemble_verify_tokens(
     const int32_t* d_drafts,
     int32_t* d_tokens,
     int32_t num_drafts,
+    cudaStream_t stream);
+
+void launch_assemble_batched_verify_tokens(
+    const BatchSeqMeta* d_seq_meta,
+    int32_t num_seqs,
+    const int32_t* d_slot_anchors,
+    const int32_t* d_slot_drafts,
+    int32_t* d_out_tokens,
+    int32_t* d_out_draft_tokens,
     cudaStream_t stream);
 
 struct AdaptiveGraph;

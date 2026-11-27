@@ -417,8 +417,10 @@ p_ctrl_finish_kernel(
 // Batched B<=2048 DSpark Mix (576 threads float4): mixes contiguous taps[4, B, HIDDEN] -> mix_h[3, B, HIDDEN] + f_ring[last 16]!
 __global__ void __launch_bounds__(576)
 p_dspark_mix_h_kernel(
-    const float* __restrict__ taps,       // [4, B, HIDDEN]
+    const float* __restrict__ taps,       // [4, tap_stride, HIDDEN]
     int B,
+    int tap_stride,
+    int tap_offset,
     const float* __restrict__ fuse_alpha, // [4, 4]
     const __nv_bfloat16* __restrict__ n0,
     const __nv_bfloat16* __restrict__ n1,
@@ -440,10 +442,11 @@ p_dspark_mix_h_kernel(
     const float a2 = fuse_alpha[m * 4 + 2];
     const float a3 = fuse_alpha[m * 4 + 3];
 
-    float4 v0 = *reinterpret_cast<const float4*>(taps + ((size_t)0 * B + b) * HIDDEN + c4);
-    float4 v1 = *reinterpret_cast<const float4*>(taps + ((size_t)1 * B + b) * HIDDEN + c4);
-    float4 v2 = *reinterpret_cast<const float4*>(taps + ((size_t)2 * B + b) * HIDDEN + c4);
-    float4 v3 = *reinterpret_cast<const float4*>(taps + ((size_t)3 * B + b) * HIDDEN + c4);
+    const int tb = tap_offset + b;
+    float4 v0 = *reinterpret_cast<const float4*>(taps + ((size_t)0 * tap_stride + tb) * HIDDEN + c4);
+    float4 v1 = *reinterpret_cast<const float4*>(taps + ((size_t)1 * tap_stride + tb) * HIDDEN + c4);
+    float4 v2 = *reinterpret_cast<const float4*>(taps + ((size_t)2 * tap_stride + tb) * HIDDEN + c4);
+    float4 v3 = *reinterpret_cast<const float4*>(taps + ((size_t)3 * tap_stride + tb) * HIDDEN + c4);
 
     float4 v = make_float4(
         a0 * v0.x + a1 * v1.x + a2 * v2.x + a3 * v3.x,
@@ -490,12 +493,13 @@ __global__ void p_dspark_store_ctx_kv_kernel(
     __half* __restrict__ v_scale,
     int cap,
     int b_off,
-    const int32_t* __restrict__ d_pos) {
+    const int32_t* __restrict__ d_pos,
+    const int32_t* __restrict__ page_table) {
     int b = b_off + blockIdx.x;
     int h = blockIdx.y;
     int tid = threadIdx.x;
     int pos = (*d_pos) + b;
-    int slot = pos % cap;
+    int slot = kv_phys_slot(page_table, pos, cap);
 
     const float* kp = kv + (size_t)b * (2 * KV_DIM) + h * HEAD_DIM;
     const float* vp = kv + (size_t)b * (2 * KV_DIM) + KV_DIM + h * HEAD_DIM;
@@ -1104,7 +1108,8 @@ p_global_attn_prep_store_kernel(
     __half* __restrict__ k_scale,
     __half* __restrict__ v_scale,
     int kv_cap,
-    const int32_t* __restrict__ d_pos) {
+    const int32_t* __restrict__ d_pos,
+    const int32_t* __restrict__ page_table) {
     int kind_id = blockIdx.x;
     int b = blockIdx.y;
     int tid = threadIdx.x;
@@ -1154,7 +1159,7 @@ p_global_attn_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
         __syncthreads();
-        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, k_cache, k_scale, sm);
+        store_kv_head_128<KV_FMT>(val * factor, kv_phys_slot(page_table, p, kv_cap), h, tid, k_cache, k_scale, sm);
     } else {
         int h = kind_id - 56;
         int c = h * HEAD_DIM + tid;
@@ -1173,7 +1178,7 @@ p_global_attn_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
         __syncthreads();
-        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, v_cache, v_scale, sm);
+        store_kv_head_128<KV_FMT>(val * factor, kv_phys_slot(page_table, p, kv_cap), h, tid, v_cache, v_scale, sm);
     }
 }
 
@@ -1195,7 +1200,8 @@ p_flash_attn_prefill_tc_kernel(
     int kv_cap,
     int window,
     int B,
-    const int32_t* __restrict__ d_pos) {
+    const int32_t* __restrict__ d_pos,
+    const int32_t* __restrict__ page_table) {
     constexpr int Q_MAX = Q_TOK * GQA_RATIO;     // 96 (global) or 48 (local)
     constexpr int NUM_WARPS = Q_MAX / 16;        // 6 or 3
     constexpr int THREADS = NUM_WARPS * 32;      // 192 or 96
@@ -1316,7 +1322,7 @@ p_flash_attn_prefill_tc_kernel(
             int t_loc = idx >> 4;
             int sub = idx & 15;
             if (t_loc < tile_len) {
-                int slot = (t0 + t_loc) % kv_cap;
+                int slot = kv_phys_slot(page_table, t0 + t_loc, kv_cap);
                 *reinterpret_cast<uint4*>(&s_k[t_loc][sub * 8]) =
                     load_kv_8elems_h2x4<KV_FMT>(k_cache, k_scale, slot, kvh, sub);
                 *reinterpret_cast<uint4*>(&s_v[t_loc][sub * 8]) =
@@ -1580,9 +1586,11 @@ void launch_prefill_dspark_commit(
     __half* ctx_ks[MTP_LAYERS], __half* ctx_vs[MTP_LAYERS],
     int ctx_cap[MTP_LAYERS], KVFormat global_kv_fmt,
     float* f_ring, __half* scratch_mix_h, float* scratch_kv, __half* w_f16_scratch,
-    int B, const int32_t* d_pos, cudaStream_t stream) {
+    int B, const int32_t* d_pos, cudaStream_t stream, const int32_t* ds_page_table,
+    int tap_stride, int tap_offset) {
+    const int ts = (tap_stride > 0) ? tap_stride : B;
     p_dspark_mix_h_kernel<<<dim3(B, 4), 576, 0, stream>>>(
-        taps, B, dw.fuse_alpha,
+        taps, B, ts, tap_offset, dw.fuse_alpha,
         dw.layers[0].dflare_norm, dw.layers[1].dflare_norm, dw.layers[2].dflare_norm,
         dw.markov_dflare_norm, scratch_mix_h, f_ring, d_pos);
     for (int l = 0; l < MTP_LAYERS; ++l) {
@@ -1592,15 +1600,16 @@ void launch_prefill_dspark_commit(
         int b_off = (B > cap) ? (B - cap) : 0;
         int n_store = B - b_off;
         KVFormat lfmt = dw.layers[l].is_local ? KVFormat::BF16 : global_kv_fmt;
+        const int32_t* pt = dw.layers[l].is_local ? nullptr : ds_page_table;
         if (lfmt == KVFormat::FP8) {
             p_dspark_store_ctx_kv_kernel<1><<<dim3(n_store, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
-                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], cap, b_off, d_pos);
+                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], cap, b_off, d_pos, pt);
         } else if (lfmt == KVFormat::Q4) {
             p_dspark_store_ctx_kv_kernel<2><<<dim3(n_store, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
-                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], cap, b_off, d_pos);
+                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], cap, b_off, d_pos, pt);
         } else {
             p_dspark_store_ctx_kv_kernel<0><<<dim3(n_store, NUM_KV_HEADS), HEAD_DIM, 0, stream>>>(
-                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], cap, b_off, d_pos);
+                scratch_kv, dw.layers[l].k_norm_ctx, ctx_k[l], ctx_v[l], ctx_ks[l], ctx_vs[l], cap, b_off, d_pos, pt);
         }
     }
 }
@@ -1629,7 +1638,7 @@ void launch_prefill_global_sconv_prep_store(
     void* k_cache, void* v_cache, __half* k_scale, __half* v_scale,
     KVFormat kv_fmt, int kv_cap,
     float* scratch_taps, __half* w_f16_scratch,
-    int B, const int32_t* d_pos, cudaStream_t stream) {
+    int B, const int32_t* d_pos, cudaStream_t stream, const int32_t* page_table) {
     // 1. Batched cuBLAS FP16 TC dynamic tap projections ([32, 2304] x [B, 2304])
     float* k_taps = scratch_taps;
     float* v_taps = scratch_taps + (size_t)B * 32;
@@ -1643,15 +1652,15 @@ void launch_prefill_global_sconv_prep_store(
     if (kv_fmt == KVFormat::FP8) {
         p_global_attn_prep_store_kernel<1><<<grid, 128, 0, stream>>>(
             qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_taps, v_taps, k_ring, v_ring,
-            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos, page_table);
     } else if (kv_fmt == KVFormat::Q4) {
         p_global_attn_prep_store_kernel<2><<<grid, 128, 0, stream>>>(
             qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_taps, v_taps, k_ring, v_ring,
-            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos, page_table);
     } else {
         p_global_attn_prep_store_kernel<0><<<grid, 128, 0, stream>>>(
             qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_taps, v_taps, k_ring, v_ring,
-            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+            q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos, page_table);
     }
     p_kv_ring_commit_kernel<<<dim3((KV_DIM >> 2) / 256, 2), 256, 0, stream>>>(
         k_proj, v_proj, k_ring, v_ring, B, d_pos);
@@ -1662,24 +1671,25 @@ void launch_prefill_flash_attn_tc(
     const void* k_cache, const void* v_cache,
     const __half* k_scale, const __half* v_scale,
     KVFormat kv_fmt, __half* out_gated_h,
-    int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream) {
+    int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream,
+    const int32_t* page_table) {
     if (window > 0) {
         // Local SWA (BF16): Q_TOK=16 (48 queries/CTA, 3 warps=96 threads -> 128 CTAs for B=256 = 1 wave!)
         dim3 grid(NUM_KV_HEADS, (B + 15) / 16);
         p_flash_attn_prefill_tc_kernel<0, 16><<<grid, 96, 0, stream>>>(
-            qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, window, B, d_pos);
+            qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, window, B, d_pos, nullptr);
     } else {
         // Global (BF16/FP8/Q4): Q_TOK=32 (96 queries/CTA, 6 warps=192 threads -> 128 CTAs for B=512 = 1 wave!)
         dim3 grid(NUM_KV_HEADS, (B + 31) / 32);
         if (kv_fmt == KVFormat::FP8) {
             p_flash_attn_prefill_tc_kernel<1, 32><<<grid, 192, 0, stream>>>(
-                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos);
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos, page_table);
         } else if (kv_fmt == KVFormat::Q4) {
             p_flash_attn_prefill_tc_kernel<2, 32><<<grid, 192, 0, stream>>>(
-                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos);
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos, page_table);
         } else {
             p_flash_attn_prefill_tc_kernel<0, 32><<<grid, 192, 0, stream>>>(
-                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos);
+                qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, out_gated_h, kv_cap, 0, B, d_pos, page_table);
         }
     }
 }

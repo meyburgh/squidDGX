@@ -357,6 +357,110 @@ linear_nvfp4_mma_kernel(
     }
 }
 
+// Multi-block (B = N_BLKS * 8 = 16, 24, 32) Tensor Core NVFP4 GEMV:
+// Loads & decodes NVFP4 weights ONCE from DRAM across N_BLKS blocks of 8 rows (L2-cached X)!
+template <int N_BLKS, bool ADD_RES, int K_DIM, int SPLITK>
+__global__ void __launch_bounds__(SPLITK * 32)
+linear_nvfp4_mma_multi8_kernel(
+    const uint8_t* __restrict__ w_data,
+    const uint8_t* __restrict__ w_scales,
+    float global_scale,
+    const __half* __restrict__ x_h,
+    float* __restrict__ y,
+    int N, uint32_t zero) {
+    constexpr int TOTAL_U = K_DIM / (128 * SPLITK);
+    constexpr int U = 3;
+    static_assert(TOTAL_U * 128 * SPLITK == K_DIM && TOTAL_U % U == 0);
+    constexpr int NB = TOTAL_U / U;
+    constexpr int CB = K_DIM >> 1;
+    constexpr int SB = K_DIM >> 4;
+    __shared__ float cs[SPLITK][16][8];
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int g = lane >> 2; // 0..7
+    const int t = lane & 3;
+    const int r0 = blockIdx.x * 16;
+    const int ra = r0 + g, rb = r0 + g + 8;
+    const bool la = (ra < N), lb = (rb < N);
+    const int c_warp = warp * (4 * TOTAL_U) + t;
+
+    float d[N_BLKS][4];
+    #pragma unroll
+    for (int blk = 0; blk < N_BLKS; ++blk) d[blk][0] = d[blk][1] = d[blk][2] = d[blk][3] = 0.f;
+
+    #pragma unroll 1
+    for (int jb = 0; jb < NB; ++jb) {
+        const int c_base = c_warp + jb * (4 * U);
+        Nvfp4Chunk32 A[U], B[U];
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            int c = c_base + 4 * u;
+            if (la) A[u] = load_nvfp4_chunk32(w_data + (size_t)ra * CB, w_scales + (size_t)ra * SB, c);
+            else { A[u].q = make_uint4(0, 0, 0, 0); A[u].s = 0; }
+            if (lb) B[u] = load_nvfp4_chunk32(w_data + (size_t)rb * CB, w_scales + (size_t)rb * SB, c);
+            else { B[u].q = make_uint4(0, 0, 0, 0); B[u].s = 0; }
+        }
+        if (jb == 0) {
+            pdl_wait_fenced(zero);
+            pdl_trigger();
+        }
+        uint32_t dep = 0;
+        #pragma unroll
+        for (int u = 0; u < U; ++u) dep ^= A[u].q.x ^ A[u].q.w ^ B[u].q.x ^ B[u].q.w;
+        dep &= zero;
+
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            uint32_t a[16], b[16];
+            decode_nvfp4_chunk32_f16(A[u], a);
+            decode_nvfp4_chunk32_f16(B[u], b);
+            int col = (c_base + 4 * u) * 32;
+            #pragma unroll
+            for (int blk = 0; blk < N_BLKS; ++blk) {
+                const __half* xg = x_h + (size_t)(blk * 8 + g) * K_DIM + col;
+                uint32_t xw[16];
+                #pragma unroll
+                for (int v = 0; v < 4; ++v) {
+                    uint4 q = ld_dep_u4(xg + 8 * v);
+                    xw[4 * v + 0] = q.x; xw[4 * v + 1] = q.y;
+                    xw[4 * v + 2] = q.z; xw[4 * v + 3] = q.w;
+                }
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    mma_m16n8k16_f32_f16(d[blk][0], d[blk][1], d[blk][2], d[blk][3],
+                                         a[2 * i], b[2 * i], a[2 * i + 1], b[2 * i + 1],
+                                         xw[2 * i] ^ dep, xw[2 * i + 1],
+                                         d[blk][0], d[blk][1], d[blk][2], d[blk][3]);
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int blk = 0; blk < N_BLKS; ++blk) {
+        cs[warp][g][2 * t]     = d[blk][0];
+        cs[warp][g][2 * t + 1] = d[blk][1];
+        cs[warp][g + 8][2 * t]     = d[blk][2];
+        cs[warp][g + 8][2 * t + 1] = d[blk][3];
+        __syncthreads();
+        if (threadIdx.x < 128) {
+            int m = threadIdx.x >> 4;
+            int r = threadIdx.x & 15;
+            int row = r0 + r;
+            if (row < N) {
+                float s = 0.f;
+                #pragma unroll
+                for (int w = 0; w < SPLITK; ++w) s += cs[w][r][m];
+                s *= global_scale;
+                if constexpr (ADD_RES) y[(size_t)(blk * 8 + m) * N + row] += s;
+                else                   y[(size_t)(blk * 8 + m) * N + row] = s;
+            }
+        }
+        if (blk + 1 < N_BLKS) __syncthreads();
+    }
+}
+
 // FUSED Q+R+Gate+Sink (6552) + K (1024) + V (1024) = 8600 rows in ONE launch!
 // B=1: 1075 CTAs x 128 threads (16 threads/row), pre-issues ALL 9 weight chunks before pdl_wait_fenced!
 __global__ void __launch_bounds__(128)
@@ -1278,7 +1382,7 @@ lm_head_stage1_kernel(
     int32_t* __restrict__ blk_max_idx,
     const SampleConfig* __restrict__ sample_cfg,
     int V) {
-    const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp != 0.0f);
+    const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp != 0.0f || (sample_cfg->pad & 1u) != 0u);
     __shared__ uint16_t s_x16[B_CONST * HIDDEN];
     int tid = threadIdx.x;
     int total_x = B_CONST * HIDDEN;
@@ -1442,7 +1546,7 @@ lm_head_nvfp4_mma_stage1_kernel(
     int32_t* __restrict__ blk_max_idx,
     const SampleConfig* __restrict__ sample_cfg,
     int V, uint32_t zero) {
-    const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp != 0.0f);
+    const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp != 0.0f || (sample_cfg->pad & 1u) != 0u);
     constexpr int SPLITK = 6;
     constexpr int U = 3; // 6 * 3 * 128 = 2304
     constexpr int CB = HIDDEN >> 1;
@@ -1576,7 +1680,7 @@ lm_head_fp8_mma_stage1_kernel(
     int32_t* __restrict__ blk_max_idx,
     const SampleConfig* __restrict__ sample_cfg,
     int V, uint32_t zero) {
-    const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp != 0.0f);
+    const bool write_logits = (out_logits != nullptr) && (sample_cfg == nullptr || sample_cfg->inv_temp != 0.0f || (sample_cfg->pad & 1u) != 0u);
     constexpr int SPLITK = 6;
     constexpr int U = 3; // 6 * 3 * 128 = 2304
     __shared__ float cs[SPLITK][16][8];
@@ -1703,7 +1807,8 @@ __global__ void lm_head_stage2_argmax_kernel(
     const int32_t* __restrict__ inv_draft_vocab,
     int draft_vocab_size,
     int V,
-    int B) {
+    int B,
+    const BatchTokenMeta* __restrict__ tok_meta) {
     pdl_wait_fenced(0u);
     int b = blockIdx.x;
     if (b >= B) return;
@@ -1726,7 +1831,10 @@ __global__ void lm_head_stage2_argmax_kernel(
     if ((tid & 31) == 0) { sv[tid >> 5] = bv; si[tid >> 5] = bi; }
     __syncthreads();
 
-    const bool do_sample = (sample_cfg != nullptr && sample_cfg->inv_temp > 0.0f && sample_cfg->top_k != 1 && out_logits != nullptr);
+    const SampleConfig* sc = (sample_cfg != nullptr)
+        ? (tok_meta ? &sample_cfg[tok_meta[b].slot_id] : sample_cfg)
+        : nullptr;
+    const bool do_sample = (sc != nullptr && sc->inv_temp > 0.0f && sc->top_k != 1 && out_logits != nullptr);
     if (!do_sample) {
         if (tid == 0) {
             bv = sv[0]; bi = si[0];
@@ -1759,11 +1867,11 @@ __global__ void lm_head_stage2_argmax_kernel(
 
     const float max_logit = s_max_val;
     const int32_t greedy_idx = s_max_idx;
-    const float inv_temp = sample_cfg->inv_temp;
-    const float top_p = sample_cfg->top_p;
-    const int32_t top_k = sample_cfg->top_k;
-    const uint64_t seed = sample_cfg->seed;
-    const int32_t pos = d_pos ? (*d_pos + b) : b;
+    const float inv_temp = sc->inv_temp;
+    const float top_p = sc->top_p;
+    const int32_t top_k = sc->top_k;
+    const uint64_t seed = sc->seed;
+    const int32_t pos = tok_meta ? tok_meta[b].pos : (d_pos ? (*d_pos + b) : b);
     const float* logits = out_logits + (size_t)b * V;
 
     if ((top_p > 0.0f && top_p < 0.9999f) || top_k > 0) {
@@ -1803,8 +1911,9 @@ __global__ void lm_head_stage2_argmax_kernel(
 
     const float tau = s_tau;
 
-    // Exact Leviathan/Chen stochastic rejection sampling for verified draft slots b in 0..B-2!
-    if (d_draft_tokens != nullptr && b < B - 1) {
+    // Exact Leviathan/Chen stochastic rejection sampling for verified draft slots!
+    const bool is_draft_row = (d_draft_tokens != nullptr) && (tok_meta ? (d_draft_tokens[b] >= 0) : (b < B - 1));
+    if (is_draft_row) {
         float local_z = 0.0f;
         for (int row = tid; row < V; row += 256) {
             float l = ld_dep_f32(logits + row);
@@ -2269,17 +2378,53 @@ void launch_linear(
     }
 }
 
+template <int N_BLKS>
+static bool dispatch_linear_h_multi8(
+    const LinearWeight& w, const __half* x_h, float* y, bool add_res, cudaStream_t stream) {
+    if (w.kind != WeightKind::NVFP4) return false;
+    int grid = (w.rows + 15) / 16;
+    if (w.cols == 3072) {
+        if (add_res) launch_pdl(linear_nvfp4_mma_multi8_kernel<N_BLKS, true, 3072, 8>, dim3(grid), 256, stream,
+            static_cast<const uint8_t*>(w.data), w.scales, w.global_scale, x_h, y, w.rows, 0u);
+        else launch_pdl(linear_nvfp4_mma_multi8_kernel<N_BLKS, false, 3072, 8>, dim3(grid), 256, stream,
+            static_cast<const uint8_t*>(w.data), w.scales, w.global_scale, x_h, y, w.rows, 0u);
+        return true;
+    } else if (w.cols == 2304) {
+        if (add_res) launch_pdl(linear_nvfp4_mma_multi8_kernel<N_BLKS, true, 2304, 6>, dim3(grid), 192, stream,
+            static_cast<const uint8_t*>(w.data), w.scales, w.global_scale, x_h, y, w.rows, 0u);
+        else launch_pdl(linear_nvfp4_mma_multi8_kernel<N_BLKS, false, 2304, 6>, dim3(grid), 192, stream,
+            static_cast<const uint8_t*>(w.data), w.scales, w.global_scale, x_h, y, w.rows, 0u);
+        return true;
+    } else if (w.cols == 9216) {
+        if (add_res) launch_pdl(linear_nvfp4_mma_multi8_kernel<N_BLKS, true, 9216, 8>, dim3(grid), 256, stream,
+            static_cast<const uint8_t*>(w.data), w.scales, w.global_scale, x_h, y, w.rows, 0u);
+        else launch_pdl(linear_nvfp4_mma_multi8_kernel<N_BLKS, false, 9216, 8>, dim3(grid), 256, stream,
+            static_cast<const uint8_t*>(w.data), w.scales, w.global_scale, x_h, y, w.rows, 0u);
+        return true;
+    }
+    return false;
+}
+
 void launch_linear_h(
     const LinearWeight& w, const __half* x_h, float* y, int B, bool add_residual, cudaStream_t stream) {
-    switch (B) {
-        case 1: dispatch_linear_h_b<1>(w, x_h, y, add_residual, stream); break;
-        case 2: dispatch_linear_h_b<2>(w, x_h, y, add_residual, stream); break;
-        case 3: dispatch_linear_h_b<3>(w, x_h, y, add_residual, stream); break;
-        case 4: dispatch_linear_h_b<4>(w, x_h, y, add_residual, stream); break;
-        case 5: dispatch_linear_h_b<5>(w, x_h, y, add_residual, stream); break;
-        case 6: dispatch_linear_h_b<6>(w, x_h, y, add_residual, stream); break;
-        case 7: dispatch_linear_h_b<7>(w, x_h, y, add_residual, stream); break;
-        case 8: dispatch_linear_h_b<8>(w, x_h, y, add_residual, stream); break;
+    if (B == 16 && dispatch_linear_h_multi8<2>(w, x_h, y, add_residual, stream)) return;
+    if (B == 24 && dispatch_linear_h_multi8<3>(w, x_h, y, add_residual, stream)) return;
+    if (B == 32 && dispatch_linear_h_multi8<4>(w, x_h, y, add_residual, stream)) return;
+    while (B > 0) {
+        int chunk = (B >= 8) ? 8 : B;
+        switch (chunk) {
+            case 1: dispatch_linear_h_b<1>(w, x_h, y, add_residual, stream); break;
+            case 2: dispatch_linear_h_b<2>(w, x_h, y, add_residual, stream); break;
+            case 3: dispatch_linear_h_b<3>(w, x_h, y, add_residual, stream); break;
+            case 4: dispatch_linear_h_b<4>(w, x_h, y, add_residual, stream); break;
+            case 5: dispatch_linear_h_b<5>(w, x_h, y, add_residual, stream); break;
+            case 6: dispatch_linear_h_b<6>(w, x_h, y, add_residual, stream); break;
+            case 7: dispatch_linear_h_b<7>(w, x_h, y, add_residual, stream); break;
+            case 8: dispatch_linear_h_b<8>(w, x_h, y, add_residual, stream); break;
+        }
+        x_h += (size_t)chunk * w.cols;
+        y += (size_t)chunk * w.rows;
+        B -= chunk;
     }
 }
 
@@ -2357,7 +2502,7 @@ static void dispatch_lm_head(
     float* s_val, int32_t* s_idx, const SampleConfig* sample_cfg, const int32_t* d_pos,
     const int32_t* d_draft_tokens, const float* d_draft_probs, const float* d_draft_q_sel,
     const int32_t* d_draft_is_delta, const int32_t* inv_draft_vocab, int draft_vocab_size,
-    cudaStream_t stream) {
+    cudaStream_t stream, const BatchTokenMeta* tok_meta) {
     if (u.kind == WeightKind::NVFP4) {
         if constexpr (B_CONST >= 2) {
             launch_pdl(lm_head_nvfp4_mma_stage1_kernel<B_CONST>, dim3(LM_HEAD_BLOCKS), 192, stream,
@@ -2385,7 +2530,7 @@ static void dispatch_lm_head(
     launch_pdl(lm_head_stage2_argmax_kernel, dim3(B_CONST), 256, stream,
         s_val, s_idx, out_logits, out_toks, sample_cfg, d_pos,
         d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta,
-        inv_draft_vocab, draft_vocab_size, u.rows, B_CONST);
+        inv_draft_vocab, draft_vocab_size, u.rows, B_CONST, tok_meta);
 }
 
 void launch_lm_head_argmax(
@@ -2393,22 +2538,22 @@ void launch_lm_head_argmax(
     float* scratch_vals, int32_t* scratch_idxs, const SampleConfig* sample_cfg,
     const int32_t* d_pos, const int32_t* d_draft_tokens, const float* d_draft_probs,
     const float* d_draft_q_sel, const int32_t* d_draft_is_delta, const int32_t* inv_draft_vocab,
-    int draft_vocab_size, int B, cudaStream_t stream) {
+    int draft_vocab_size, int B, cudaStream_t stream, const BatchTokenMeta* tok_meta) {
     switch (B) {
-        case 1: dispatch_lm_head<1>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream); break;
-        case 2: dispatch_lm_head<2>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream); break;
-        case 3: dispatch_lm_head<3>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream); break;
-        case 4: dispatch_lm_head<4>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream); break;
-        case 5: dispatch_lm_head<5>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream); break;
-        case 6: dispatch_lm_head<6>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream); break;
-        case 7: dispatch_lm_head<7>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream); break;
-        case 8: dispatch_lm_head<8>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream); break;
+        case 1: dispatch_lm_head<1>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream, tok_meta); break;
+        case 2: dispatch_lm_head<2>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream, tok_meta); break;
+        case 3: dispatch_lm_head<3>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream, tok_meta); break;
+        case 4: dispatch_lm_head<4>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream, tok_meta); break;
+        case 5: dispatch_lm_head<5>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream, tok_meta); break;
+        case 6: dispatch_lm_head<6>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream, tok_meta); break;
+        case 7: dispatch_lm_head<7>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream, tok_meta); break;
+        case 8: dispatch_lm_head<8>(unembed, x, out_tokens, out_logits, scratch_vals, scratch_idxs, sample_cfg, d_pos, d_draft_tokens, d_draft_probs, d_draft_q_sel, d_draft_is_delta, inv_draft_vocab, draft_vocab_size, stream, tok_meta); break;
         default:
             for (int i = 0; i < B; ++i) {
                 dispatch_lm_head<1>(unembed, x + (size_t)i * HIDDEN, out_tokens + i,
                     out_logits ? out_logits + (size_t)i * unembed.rows : nullptr,
                     scratch_vals, scratch_idxs, sample_cfg, d_pos,
-                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, stream);
+                    nullptr, nullptr, nullptr, nullptr, nullptr, 0, stream, nullptr);
             }
             break;
     }

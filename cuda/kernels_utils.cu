@@ -463,4 +463,38 @@ void adaptive_graph_destroy(AdaptiveGraph* graph) {
     delete graph;
 }
 
+namespace {
+__global__ void assemble_batched_verify_tokens_kernel(
+    const BatchSeqMeta* __restrict__ seq_meta,
+    int32_t num_seqs,
+    const int32_t* __restrict__ slot_anchors,
+    const int32_t* __restrict__ slot_drafts,
+    int32_t* __restrict__ out_tokens,
+    int32_t* __restrict__ out_draft_tokens) {
+    if (threadIdx.x != 0) return;
+    for (int32_t si = 0; si < num_seqs; ++si) {
+        const BatchSeqMeta sm = seq_meta[si];
+        out_tokens[sm.batch_off] = slot_anchors[sm.slot_id];
+        for (int32_t j = 0; j < sm.width - 1; ++j) {
+            const int32_t d = slot_drafts[sm.slot_id * MTP_MAX_DRAFTS + j];
+            out_tokens[sm.batch_off + 1 + j] = d;
+            out_draft_tokens[sm.batch_off + j] = d;
+        }
+        out_draft_tokens[sm.batch_off + sm.width - 1] = -1;
+    }
+}
+} // namespace
+
+void launch_assemble_batched_verify_tokens(
+    const BatchSeqMeta* d_seq_meta,
+    int32_t num_seqs,
+    const int32_t* d_slot_anchors,
+    const int32_t* d_slot_drafts,
+    int32_t* d_out_tokens,
+    int32_t* d_out_draft_tokens,
+    cudaStream_t stream) {
+    assemble_batched_verify_tokens_kernel<<<1, 1, 0, stream>>>(
+        d_seq_meta, num_seqs, d_slot_anchors, d_slot_drafts, d_out_tokens, d_out_draft_tokens);
+}
+
 } // namespace squid

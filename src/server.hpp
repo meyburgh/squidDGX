@@ -29,6 +29,8 @@ struct ServerConfig {
     int32_t default_top_k = 0;
     uint32_t context_tokens_max = 262144;
     uint32_t max_output_tokens = 65536;
+    uint32_t max_batch_slots = MAX_BATCH_SLOTS;
+    MtpRampPolicy mtp_ramp{};
     bool raw_thinking = false;
     bool keep_history_thinking = false;
 };

@@ -136,12 +136,35 @@ static_assert(MTP_BLOCK_SIZE == MTP_MAX_DRAFTS + 1, "MTP_BLOCK_SIZE must equal M
 
 // Device-resident sampling config (uploaded via H2D before generate; zero graph rebuild!)
 // inv_temp == 0.0f => pure greedy argmax with zero extra memory traffic.
+// pad bit 0 == 1 => force stage1 to write post-softcap logits even if slot 0 is greedy (batched multi-slot).
 struct SampleConfig {
     float inv_temp;
     float top_p;
     int32_t top_k;
     uint32_t pad;
     uint64_t seed;
+};
+
+// Continuous batching & Paged Shared KV Pool constants
+constexpr int MAX_BATCH_SLOTS = 8;
+constexpr int MAX_DSPARK_SLOTS = 4;      // slots 0..3 can run DSpark MTP concurrently
+constexpr int KV_PAGE_SIZE = 256;        // 256 tokens per global KV page (exact multiple of 32/64 tiles)
+constexpr int KV_PAGE_SHIFT = 8;
+constexpr int KV_PAGE_MASK = KV_PAGE_SIZE - 1;
+constexpr int MAX_KV_PAGES = 4096;       // up to 1,048,576 tokens per sequence
+
+struct BatchTokenMeta {
+    int32_t slot_id;    // 0..MAX_BATCH_SLOTS-1
+    int32_t pos;        // logical sequence position of this token
+    int32_t local_off;  // 0..width-1 offset within this slot's tokens in the batch
+    int32_t seq_idx;    // 0..num_seqs-1 index into BatchSeqMeta
+};
+
+struct BatchSeqMeta {
+    int32_t slot_id;    // 0..MAX_BATCH_SLOTS-1
+    int32_t pos0;       // logical start position of this seq's tokens in the batch
+    int32_t batch_off;  // starting row b in [0..B-1]
+    int32_t width;      // number of tokens for this seq in the batch (1..MTP_BLOCK_SIZE)
 };
 
 constexpr int KV_SPLIT_K = 64;    // 8 KV heads x 64 bulk splits = 512 CTAs

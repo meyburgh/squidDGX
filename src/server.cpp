@@ -419,17 +419,23 @@ struct InklingStreamParser {
         std::string_view content;
     };
 
-    void init(const Tokenizer* tok, bool raw, ServerBuffers& buf, uint64_t seed) {
+    void init_with_bufs(const Tokenizer* tok, bool raw, char* cbuf, size_t ccap, char* rbuf, size_t rcap,
+                        char* trbuf, size_t trcap, char* tsbuf, size_t tscap, uint64_t seed) {
         tokenizer = tok;
         raw_thinking = raw;
         section = InklingSection::None;
         pending_utf8_len = 0;
-        content_writer = ByteWriter(buf.content_buf, kContentBufferBytes);
-        reasoning_writer = ByteWriter(buf.reasoning_buf, kReasoningBufferBytes);
-        tool_raw_writer = ByteWriter(buf.tool_raw_buf, kToolRawBytes);
-        tool_store_writer = ByteWriter(buf.tool_store_buf, kToolStoreBytes);
+        content_writer = ByteWriter(cbuf, ccap);
+        reasoning_writer = ByteWriter(rbuf, rcap);
+        tool_raw_writer = ByteWriter(trbuf, trcap);
+        tool_store_writer = ByteWriter(tsbuf, tscap);
         tool_call_count = 0;
         prng_state = seed;
+    }
+
+    void init(const Tokenizer* tok, bool raw, ServerBuffers& buf, uint64_t seed) {
+        init_with_bufs(tok, raw, buf.content_buf, kContentBufferBytes, buf.reasoning_buf, kReasoningBufferBytes,
+                       buf.tool_raw_buf, kToolRawBytes, buf.tool_store_buf, kToolStoreBytes, seed);
     }
 
     FeedDelta feed(int32_t token_id) {
@@ -2822,36 +2828,912 @@ void handle_semif_score(
     send_json_response(fd, 200, bw.slice());
 }
 
-// --- Connection handling ----------------------------------------------------------------------
-// One engine, many connections: each accepted connection gets a worker thread and a slot that
-// owns its request buffer and a small reply buffer. Cheap endpoints (/health, /v1/models,
-// OPTIONS, errors) answer at once from the slot; engine endpoints take g_engine_mutex and use the
-// shared ServerBuffers, so they run one at a time in arrival order (std::mutex is not FIFO, but
-// the router sends one request per target at a time). With every slot taken, a new connection
-// gets an immediate 503 instead of waiting unanswered in the listen backlog.
-constexpr int kConnSlots = 8;
+// --- Continuous Batching Scheduler & Connection Handling --------------------------------------
+constexpr int kConnSlots = 16;
 constexpr size_t kSmallBufBytes = 64 * 1024;
+constexpr size_t kConnResponseBytes = 2 * 1024 * 1024;
+constexpr size_t kConnContentBytes = 1 * 1024 * 1024;
+constexpr size_t kConnReasoningBytes = 1 * 1024 * 1024;
+constexpr size_t kConnGenTokensMax = 65536;
 
 struct ConnSlot {
     char* request_buf = nullptr;
     char* small_buf = nullptr;
+    char* response_buf = nullptr;
+    char* content_buf = nullptr;
+    char* reasoning_buf = nullptr;
+    char* tool_raw_buf = nullptr;
+    char* tool_store_buf = nullptr;
+    char* sse_buf = nullptr;
+    int32_t* gen_tokens = nullptr;
     bool in_use = false;
+
+    void init() {
+        request_buf = alloc_host_zeroed<char>(kRequestBufferBytes);
+        small_buf = alloc_host_zeroed<char>(kSmallBufBytes);
+        response_buf = alloc_host_zeroed<char>(kConnResponseBytes);
+        content_buf = alloc_host_zeroed<char>(kConnContentBytes);
+        reasoning_buf = alloc_host_zeroed<char>(kConnReasoningBytes);
+        tool_raw_buf = alloc_host_zeroed<char>(kToolRawBytes);
+        tool_store_buf = alloc_host_zeroed<char>(kToolStoreBytes);
+        sse_buf = alloc_host_zeroed<char>(kSseFrameBytes);
+        gen_tokens = alloc_host_zeroed<int32_t>(kConnGenTokensMax);
+    }
+
+    void deinit() {
+        free_host(request_buf);
+        free_host(small_buf);
+        free_host(response_buf);
+        free_host(content_buf);
+        free_host(reasoning_buf);
+        free_host(tool_raw_buf);
+        free_host(tool_store_buf);
+        free_host(sse_buf);
+        free_host(gen_tokens);
+    }
 };
 
 std::mutex g_engine_mutex;
+std::mutex g_tok_mutex;
 std::atomic<bool> g_engine_busy{false};
+std::atomic<int> g_engine_active{0};
 std::atomic<int> g_engine_waiting{0};
+
+struct BatchJob {
+    static constexpr uint32_t kRingCap = 1024;
+    static constexpr uint32_t kRingMask = kRingCap - 1;
+
+    std::vector<int32_t> prompt;
+    uint32_t max_new_tokens = 1;
+    uint32_t req_mtp = 0;
+    SampleParams sample{};
+    GenerateStats stats{};
+    uint64_t t_prefill_start = 0;
+    uint64_t t_decode_start = 0;
+
+    std::mutex mu;
+    std::condition_variable cv;
+    int32_t ring[kRingCap]{};
+    uint32_t head = 0;
+    uint32_t tail = 0;
+    bool done = false;
+    std::atomic<bool> cancelled{false};
+
+    void push_token(int32_t tok) {
+        std::unique_lock<std::mutex> lk(mu);
+        if (tail - head < kRingCap) {
+            ring[tail & kRingMask] = tok;
+            ++tail;
+        }
+        cv.notify_one();
+    }
+
+    void mark_done() {
+        std::unique_lock<std::mutex> lk(mu);
+        done = true;
+        cv.notify_one();
+    }
+};
+
+struct ContinuousScheduler {
+    Engine* engine = nullptr;
+    const ServerConfig* config = nullptr;
+    bool enabled = false;
+
+    std::mutex mu;
+    std::condition_variable cv;
+    std::condition_variable excl_cv;
+    std::vector<BatchJob*> pending;
+    int exclusive_waiters = 0;
+    bool exclusive_active = false;
+    bool stop_flag = false;
+    std::thread worker;
+
+    struct ActiveSlot {
+        bool in_use = false;
+        bool prefilling = false;
+        uint32_t prefill_done = 0;
+        int32_t pos = 0;
+        int32_t anchor = 0;
+        uint32_t generated = 0;
+        bool ds_valid = false;
+        BatchJob* job = nullptr;
+        PromptLookupIndex lookup{};
+    };
+    ActiveSlot slots[MAX_BATCH_SLOTS]{};
+
+    void start(Engine& eng, const ServerConfig& cfg) {
+        engine = &eng;
+        config = &cfg;
+        enabled = (cfg.max_batch_slots > 1 && eng.max_batch_slots > 1);
+        stop_flag = false;
+        if (enabled) {
+            worker = std::thread([this] { run_loop(); });
+        }
+    }
+
+    void stop() {
+        if (!enabled) return;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop_flag = true;
+            cv.notify_all();
+            excl_cv.notify_all();
+        }
+        if (worker.joinable()) worker.join();
+        enabled = false;
+    }
+
+    void acquire_exclusive() {
+        if (!enabled) return;
+        std::unique_lock<std::mutex> lk(mu);
+        ++exclusive_waiters;
+        cv.notify_all();
+        excl_cv.wait(lk, [&] { return exclusive_active || stop_flag; });
+    }
+
+    void release_exclusive() {
+        if (!enabled) return;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            --exclusive_waiters;
+            exclusive_active = false;
+        }
+        cv.notify_all();
+        excl_cv.notify_all();
+    }
+
+    GenerateStats run_batched(
+        const int32_t* prompt_ptr, size_t prompt_len,
+        uint32_t max_new_tokens, uint32_t req_mtp,
+        const SampleParams& sp,
+        int32_t* out_tokens, size_t out_cap,
+        TokenCallbackFn on_token, void* cb_ctx) {
+        BatchJob job{};
+        job.prompt.assign(prompt_ptr, prompt_ptr + prompt_len);
+        job.max_new_tokens = max_new_tokens;
+        job.req_mtp = req_mtp;
+        job.sample = sp;
+        job.stats.prompt_tokens = static_cast<uint32_t>(prompt_len);
+
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            pending.push_back(&job);
+            g_engine_waiting.store(static_cast<int>(pending.size()), std::memory_order_relaxed);
+            cv.notify_one();
+        }
+
+        uint32_t emitted = 0;
+        bool stop_cb = false;
+        for (;;) {
+            int32_t local_buf[64];
+            uint32_t n_pop = 0;
+            bool is_done = false;
+            {
+                std::unique_lock<std::mutex> lk(job.mu);
+                job.cv.wait(lk, [&] { return job.head < job.tail || job.done; });
+                while (job.head < job.tail && n_pop < 64) {
+                    local_buf[n_pop++] = job.ring[job.head & BatchJob::kRingMask];
+                    ++job.head;
+                }
+                is_done = job.done && (job.head == job.tail);
+            }
+            for (uint32_t i = 0; i < n_pop; ++i) {
+                const int32_t tok = local_buf[i];
+                if (out_tokens && emitted < out_cap) out_tokens[emitted] = tok;
+                ++emitted;
+                if (!stop_cb && on_token) {
+                    if (!on_token(cb_ctx, tok)) {
+                        stop_cb = true;
+                        job.cancelled.store(true, std::memory_order_release);
+                    }
+                }
+            }
+            if (is_done) break;
+        }
+        return job.stats;
+    }
+
+    void finish_slot(int s) {
+        ActiveSlot& sl = slots[s];
+        if (!sl.in_use) return;
+        BatchJob* job = sl.job;
+        if (job && job->t_decode_start > 0) {
+            job->stats.decode_ms = static_cast<double>(clock_monotonic_ns() - job->t_decode_start) / 1e6;
+        }
+        engine->release_slot_kv(s);
+        sl.in_use = false;
+        sl.prefilling = false;
+        sl.job = nullptr;
+        if (job) job->mark_done();
+    }
+
+    void run_loop() {
+        const uint32_t max_slots = std::min<uint32_t>(config->max_batch_slots, engine->max_batch_slots);
+        bool slot0_draft_in_flight = false;
+        bool slot0_cfg_uploaded = false;
+
+        auto drop_slot0_adaptive = [&] {
+            if (slot0_draft_in_flight) {
+                engine->sync_stream_for_batch();
+                slot0_draft_in_flight = false;
+            }
+            slot0_cfg_uploaded = false;
+        };
+
+        for (;;) {
+            int active_cnt = 0;
+            for (uint32_t s = 0; s < max_slots; ++s) {
+                if (slots[s].in_use) ++active_cnt;
+            }
+
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                g_engine_active.store(active_cnt, std::memory_order_relaxed);
+                g_engine_busy.store(active_cnt > 0 || exclusive_active, std::memory_order_relaxed);
+                g_engine_waiting.store(static_cast<int>(pending.size()), std::memory_order_relaxed);
+
+                if (stop_flag && active_cnt == 0 && pending.empty()) break;
+
+                if (exclusive_waiters > 0 && active_cnt == 0) {
+                    lk.unlock();
+                    drop_slot0_adaptive();
+                    lk.lock();
+                    exclusive_active = true;
+                    g_engine_busy.store(true, std::memory_order_relaxed);
+                    excl_cv.notify_all();
+                    cv.wait(lk, [&] { return !exclusive_active || stop_flag; });
+                    continue;
+                }
+
+                if (active_cnt == 0 && pending.empty() && exclusive_waiters == 0) {
+                    lk.unlock();
+                    drop_slot0_adaptive();
+                    lk.lock();
+                    cv.wait(lk, [&] { return !pending.empty() || exclusive_waiters > 0 || stop_flag; });
+                    continue;
+                }
+
+                // Brief 1.5ms burst coalesce when idle so concurrent arriving requests pack into ONE prefill
+                if (active_cnt == 0 && !pending.empty() && pending.size() < max_slots && exclusive_waiters == 0) {
+                    cv.wait_for(lk, std::chrono::microseconds(1500), [&] {
+                        return pending.size() >= max_slots || stop_flag || exclusive_waiters > 0;
+                    });
+                }
+
+                // Admit queued requests into free slots (when no exclusive waiter is draining)
+                if (exclusive_waiters == 0) {
+                    while (!pending.empty()) {
+                        int free_s = -1;
+                        for (uint32_t s = 0; s < max_slots; ++s) {
+                            if (!slots[s].in_use) { free_s = static_cast<int>(s); break; }
+                        }
+                        if (free_s < 0) break;
+                        BatchJob* next_job = pending.front();
+                        const uint32_t p_len = static_cast<uint32_t>(next_job->prompt.size());
+                        if (!engine->kv_pool.can_fit(free_s, p_len + 256u)) {
+                            // Wait for active slots to free pages (unless no slots active -> admit anyway if fits ctx)
+                            if (active_cnt > 0) break;
+                            if (!engine->kv_pool.can_fit(free_s, p_len + 16u)) {
+                                pending.erase(pending.begin());
+                                next_job->mark_done();
+                                continue;
+                            }
+                        }
+                        pending.erase(pending.begin());
+                        g_engine_waiting.store(static_cast<int>(pending.size()), std::memory_order_relaxed);
+                        lk.unlock();
+
+                        if (free_s == 0 || active_cnt > 0) drop_slot0_adaptive();
+                        engine->reset_slot(free_s);
+                        ActiveSlot& sl = slots[free_s];
+                        sl.in_use = true;
+                        sl.prefilling = true;
+                        sl.prefill_done = 0;
+                        sl.pos = 0;
+                        sl.anchor = 0;
+                        sl.generated = 0;
+                        sl.ds_valid = (next_job->req_mtp > 0 &&
+                                       static_cast<uint32_t>(free_s) < engine->max_dspark_slots &&
+                                       engine->model->mw.dspark.loaded);
+                        sl.job = next_job;
+                        next_job->t_prefill_start = clock_monotonic_ns();
+                        ++active_cnt;
+
+                        lk.lock();
+                    }
+                }
+            }
+
+            // Reap cancelled slots
+            for (uint32_t s = 0; s < max_slots; ++s) {
+                if (slots[s].in_use && slots[s].job->cancelled.load(std::memory_order_acquire)) {
+                    if (s == 0) drop_slot0_adaptive();
+                    finish_slot(static_cast<int>(s));
+                }
+            }
+
+            // Count prefilling and decoding slots
+            int prefill_slots[MAX_BATCH_SLOTS];
+            int num_prefill = 0;
+            int decode_slots[MAX_BATCH_SLOTS];
+            int num_decode = 0;
+            for (uint32_t s = 0; s < max_slots; ++s) {
+                if (!slots[s].in_use) continue;
+                if (slots[s].prefilling) {
+                    prefill_slots[num_prefill++] = static_cast<int>(s);
+                } else {
+                    decode_slots[num_decode++] = static_cast<int>(s);
+                }
+            }
+
+            // Step 1: Packed Multi-Sequence Prefill (batches multiple arriving prompts into ONE GPU pass!)
+            if (num_prefill > 0) {
+                drop_slot0_adaptive();
+                const uint32_t chunk_budget = (num_decode == 0)
+                    ? PREFILL_BATCH_MAX
+                    : std::min<uint32_t>(PREFILL_BATCH_MAX, config->mtp_ramp.prefill_chunk_tokens);
+                PrefillSlotChunk pf_chunks[MAX_BATCH_SLOTS]{};
+                int32_t pf_first_toks[MAX_BATCH_SLOTS]{};
+                int n_pf = 0;
+                uint32_t used_toks = 0;
+                for (int pi = 0; pi < num_prefill && used_toks < chunk_budget; ++pi) {
+                    const int s = prefill_slots[pi];
+                    ActiveSlot& sl = slots[s];
+                    BatchJob* job = sl.job;
+                    const uint32_t p_len = static_cast<uint32_t>(job->prompt.size());
+                    const uint32_t rem = p_len - sl.prefill_done;
+                    const uint32_t avail = chunk_budget - used_toks;
+                    uint32_t chunk = std::min(rem, avail);
+                    if (chunk < rem && chunk >= 8) chunk &= ~7u;
+                    if (chunk == 0) break;
+                    const bool is_final = (sl.prefill_done + chunk == p_len);
+                    pf_chunks[n_pf++] = {
+                        s,
+                        job->prompt.data() + sl.prefill_done,
+                        sl.prefill_done,
+                        chunk,
+                        is_final,
+                        sl.ds_valid,
+                        job->sample
+                    };
+                    used_toks += chunk;
+                }
+
+                if (n_pf > 0) {
+                    engine->prefill_multi_slot_chunk(pf_chunks, n_pf, pf_first_toks);
+                    for (int ci = 0; ci < n_pf; ++ci) {
+                        const int s = pf_chunks[ci].slot_id;
+                        ActiveSlot& sl = slots[s];
+                        BatchJob* job = sl.job;
+                        const uint32_t p_len = static_cast<uint32_t>(job->prompt.size());
+                        sl.prefill_done += pf_chunks[ci].chunk_len;
+                        if (pf_chunks[ci].is_final) {
+                            const int32_t first_tok = pf_first_toks[ci];
+                            sl.prefilling = false;
+                            sl.pos = static_cast<int32_t>(p_len);
+                            sl.anchor = first_tok;
+                            sl.generated = 1;
+                            job->stats.prefill_ms = static_cast<double>(clock_monotonic_ns() - job->t_prefill_start) / 1e6;
+                            job->t_decode_start = clock_monotonic_ns();
+                            job->stats.generated_tokens = 1;
+                            job->stats.last_token_id = first_tok;
+                            job->push_token(first_tok);
+                            if (s == 0 && engine->use_prompt_lookup) {
+                                sl.lookup.reset();
+                                const size_t seed_st = (p_len > PromptLookupIndex::kHistCap) ? (p_len - PromptLookupIndex::kHistCap) : 0;
+                                for (size_t pi = seed_st; pi < p_len; ++pi) sl.lookup.push(job->prompt[pi]);
+                                sl.lookup.push(first_tok);
+                            }
+                            if (first_tok == EOS_TOKEN || sl.generated >= job->max_new_tokens ||
+                                static_cast<uint32_t>(sl.pos) >= engine->context_tokens_max) {
+                                finish_slot(s);
+                            }
+                        }
+                    }
+                }
+                if (num_decode == 0) continue;
+            }
+
+            if (num_decode == 0) continue;
+
+            // Step 2A: C=1 adaptive CUDA Graph fast path on slot 0 (zero regression vs baseline!)
+            bool has_pending_or_prefill = false;
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                has_pending_or_prefill = !pending.empty() || exclusive_waiters > 0;
+            }
+            for (uint32_t s = 0; s < max_slots; ++s) {
+                if (slots[s].in_use && slots[s].prefilling) has_pending_or_prefill = true;
+            }
+
+            if (num_decode == 1 && decode_slots[0] == 0 && !has_pending_or_prefill) {
+                ActiveSlot& sl = slots[0];
+                BatchJob* job = sl.job;
+                const uint32_t max_rem = job->max_new_tokens - sl.generated;
+                const bool can_adaptive = sl.ds_valid &&
+                                          job->req_mtp == static_cast<uint32_t>(MTP_MAX_DRAFTS) &&
+                                          config->mtp_ramp.drafts_by_c[1] == static_cast<uint32_t>(MTP_MAX_DRAFTS) &&
+                                          engine->use_graphs && engine->spec_threshold > 0.0f &&
+                                          static_cast<uint32_t>(sl.pos) + MTP_BLOCK_SIZE <= engine->context_tokens_max &&
+                                          engine->kv_pool.can_fit(0, static_cast<uint32_t>(sl.pos) + MTP_BLOCK_SIZE + 8u);
+                if (can_adaptive) {
+                    const SingleAdaptiveStepOut out = engine->step_single_adaptive_slot0(
+                        sl.pos, sl.anchor, max_rem, job->sample,
+                        engine->use_prompt_lookup ? &sl.lookup : nullptr,
+                        &slot0_draft_in_flight, &slot0_cfg_uploaded);
+                    sl.pos += static_cast<int32_t>(out.count);
+                    sl.anchor = out.tokens[out.count - 1];
+                    job->stats.spec_steps += 1;
+                    if (out.used_lookup) job->stats.lookup_steps += 1;
+                    job->stats.total_drafts += out.drafts;
+                    job->stats.total_accepted += out.accepted;
+                    bool done_now = false;
+                    for (uint32_t i = 0; i < out.count && sl.generated < job->max_new_tokens; ++i) {
+                        const int32_t tok = out.tokens[i];
+                        if (engine->use_prompt_lookup) sl.lookup.push(tok);
+                        sl.generated += 1;
+                        job->stats.generated_tokens = sl.generated;
+                        job->stats.last_token_id = tok;
+                        job->push_token(tok);
+                        if (tok == EOS_TOKEN || sl.generated >= job->max_new_tokens) { done_now = true; break; }
+                    }
+                    if (done_now || job->cancelled.load(std::memory_order_acquire) ||
+                        static_cast<uint32_t>(sl.pos) >= engine->context_tokens_max) {
+                        drop_slot0_adaptive();
+                        finish_slot(0);
+                    }
+                    continue;
+                }
+            }
+
+            // Step 2B: General Continuous Batching Step (C = 1..max_slots) with adaptive MTP ramp-down
+            drop_slot0_adaptive();
+            const uint32_t target_k = config->mtp_ramp.drafts_by_c[num_decode];
+            uint32_t draft_budget = static_cast<uint32_t>(MTP_BLOCK_SIZE - num_decode);
+
+            BatchSlotStepIn step_in[MAX_BATCH_SLOTS]{};
+            BatchSlotStepOut step_out[MAX_BATCH_SLOTS]{};
+            bool any_k = false;
+            for (int si = 0; si < num_decode; ++si) {
+                const int s = decode_slots[si];
+                ActiveSlot& sl = slots[s];
+                BatchJob* job = sl.job;
+                const uint32_t rem_gen = job->max_new_tokens - sl.generated;
+                const uint32_t rem_ctx = (static_cast<uint32_t>(sl.pos) < engine->context_tokens_max)
+                                             ? (engine->context_tokens_max - static_cast<uint32_t>(sl.pos))
+                                             : 0u;
+                uint32_t k = 0;
+                if (target_k > 0 && sl.ds_valid && job->req_mtp > 0 && rem_gen > 1 && rem_ctx > 1 && draft_budget > 0) {
+                    k = std::min({target_k, job->req_mtp, rem_gen - 1u, rem_ctx - 1u, draft_budget});
+                    while (k > 0 && !engine->kv_pool.can_fit(s, static_cast<uint32_t>(sl.pos) + 1u + k + 8u)) --k;
+                    draft_budget -= k;
+                }
+                if (k > 0) any_k = true;
+                // Check KV page room for at least 1 token
+                if (!engine->kv_pool.can_fit(s, static_cast<uint32_t>(sl.pos) + 1u + k + 8u)) {
+                    // Out of KV pool pages for this sequence -> terminate cleanly as length limit
+                    finish_slot(s);
+                    // Compact remaining decode_slots
+                    for (int m = si + 1; m < num_decode; ++m) decode_slots[m - 1] = decode_slots[m];
+                    --num_decode;
+                    --si;
+                    continue;
+                }
+                step_in[si] = {s, sl.pos, sl.anchor, k, sl.ds_valid, job->sample};
+            }
+            if (num_decode == 0) continue;
+
+            const bool commit_ds_k0 = config->mtp_ramp.commit_dspark_in_batch;
+            engine->step_batch_decode(step_in, num_decode, commit_ds_k0, step_out);
+
+            for (int si = 0; si < num_decode; ++si) {
+                const int s = decode_slots[si];
+                ActiveSlot& sl = slots[s];
+                BatchJob* job = sl.job;
+                if (!any_k && !commit_ds_k0) sl.ds_valid = false;
+                const auto& r = step_out[si];
+                sl.pos += static_cast<int32_t>(r.count);
+                sl.anchor = r.tokens[r.count - 1];
+                if (r.drafts > 0) {
+                    job->stats.spec_steps += 1;
+                    job->stats.total_drafts += r.drafts;
+                    job->stats.total_accepted += r.accepted;
+                }
+                bool done_now = false;
+                for (uint32_t i = 0; i < r.count && sl.generated < job->max_new_tokens; ++i) {
+                    const int32_t tok = r.tokens[i];
+                    if (s == 0 && engine->use_prompt_lookup) sl.lookup.push(tok);
+                    sl.generated += 1;
+                    job->stats.generated_tokens = sl.generated;
+                    job->stats.last_token_id = tok;
+                    job->push_token(tok);
+                    if (tok == EOS_TOKEN || sl.generated >= job->max_new_tokens) { done_now = true; break; }
+                }
+                if (done_now || job->cancelled.load(std::memory_order_acquire) ||
+                    static_cast<uint32_t>(sl.pos) >= engine->context_tokens_max) {
+                    finish_slot(s);
+                }
+            }
+        }
+        drop_slot0_adaptive();
+    }
+};
+
+ContinuousScheduler g_scheduler{};
 
 struct EngineLock {
     std::unique_lock<std::mutex> lk;
     EngineLock() {
         g_engine_waiting.fetch_add(1, std::memory_order_relaxed);
         lk = std::unique_lock<std::mutex>(g_engine_mutex);
+        g_scheduler.acquire_exclusive();
         g_engine_waiting.fetch_sub(1, std::memory_order_relaxed);
         g_engine_busy.store(true, std::memory_order_relaxed);
     }
-    ~EngineLock() { g_engine_busy.store(false, std::memory_order_relaxed); }
+    ~EngineLock() {
+        g_scheduler.release_exclusive();
+        g_engine_busy.store(false, std::memory_order_relaxed);
+    }
 };
+
+void handle_chat_completions_batched(
+    int fd, std::string_view body, Engine& engine, const Tokenizer& tokenizer,
+    const ServerConfig& config, ServerBuffers& shared_buffers, ConnSlot& slot, uint64_t& prng_state) {
+    size_t pos = 0;
+    skip_ws(body, pos);
+    if (pos >= body.size() || body[pos] != '{') {
+        send_error_json(fd, 400, "Invalid JSON body", "invalid_request_error", slot.small_buf, kSmallBufBytes);
+        return;
+    }
+    ++pos;
+
+    std::string_view messages_json, tools_json;
+    char req_model_buf[128], effort_buf[32], key_buf[128];
+    std::string_view req_model = config.model_name;
+    std::string_view effort = config.default_effort;
+    const int32_t output_cap = static_cast<int32_t>(std::min(config.max_output_tokens, config.context_tokens_max));
+    int32_t max_tokens = output_cap;
+    bool has_max_completion_tokens = false;
+    float req_temp = config.default_temperature;
+    float req_top_p = config.default_top_p;
+    int32_t req_top_k = config.default_top_k;
+    bool has_seed = false;
+    uint64_t req_seed = 0;
+    bool stream = false;
+    bool include_usage = false;
+    bool enable_thinking = true;
+    std::string_view response_format_raw;
+    uint32_t max_reasoning_tokens = config.max_reasoning_tokens;
+    bool has_max_reasoning = false;
+    int32_t req_mtp = static_cast<int32_t>(config.default_mtp);
+    StopList stops{};
+
+    for (uint32_t fiter = 0; pos < body.size() && fiter < 64; ++fiter) {
+        skip_ws(body, pos);
+        if (pos < body.size() && body[pos] == '}') break;
+        std::string_view k;
+        if (!parse_json_string(body, pos, key_buf, sizeof(key_buf), &k)) {
+            send_error_json(fd, 400, "Malformed JSON key", "invalid_request_error", slot.small_buf, kSmallBufBytes);
+            return;
+        }
+        skip_ws(body, pos);
+        if (pos >= body.size() || body[pos] != ':') {
+            send_error_json(fd, 400, "Expected ':' in JSON", "invalid_request_error", slot.small_buf, kSmallBufBytes);
+            return;
+        }
+        ++pos;
+        skip_ws(body, pos);
+
+        int64_t iv = 0;
+        double dv = 0.0;
+        bool bv = false;
+        if (k == "messages") {
+            const size_t start = pos; skip_json_value(body, pos); messages_json = body.substr(start, pos - start);
+        } else if (k == "tools") {
+            const size_t start = pos; skip_json_value(body, pos); tools_json = body.substr(start, pos - start);
+        } else if (k == "model") {
+            std::string_view ms;
+            if (parse_json_string(body, pos, req_model_buf, sizeof(req_model_buf), &ms)) req_model = ms;
+            else skip_json_value(body, pos);
+        } else if (k == "reasoning_effort") {
+            if (pos < body.size() && body[pos] == '"') {
+                std::string_view es;
+                if (parse_json_string(body, pos, effort_buf, sizeof(effort_buf), &es)) effort = es;
+            } else {
+                const size_t start = pos; skip_json_value(body, pos);
+                const std::string_view rn = trim_ascii_ws(body.substr(start, pos - start));
+                if (!rn.empty() && rn.size() <= sizeof(effort_buf) && rn != "null") {
+                    std::memcpy(effort_buf, rn.data(), rn.size());
+                    effort = std::string_view(effort_buf, rn.size());
+                }
+            }
+        } else if (k == "max_completion_tokens") {
+            if (parse_json_i64_opt(body, pos, &iv)) { max_tokens = clamp_i64_to_i32(iv, 1, output_cap); has_max_completion_tokens = true; }
+        } else if (k == "max_tokens") {
+            if (parse_json_i64_opt(body, pos, &iv) && !has_max_completion_tokens) max_tokens = clamp_i64_to_i32(iv, 1, output_cap);
+        } else if (k == "temperature") {
+            if (parse_json_f64_opt(body, pos, &dv)) req_temp = static_cast<float>(dv);
+        } else if (k == "top_p") {
+            if (parse_json_f64_opt(body, pos, &dv)) req_top_p = static_cast<float>(dv);
+        } else if (k == "top_k") {
+            if (parse_json_i64_opt(body, pos, &iv)) req_top_k = clamp_i64_to_i32(iv, 0, VOCAB_UNPADDED);
+        } else if (k == "seed") {
+            if (parse_json_i64_opt(body, pos, &iv)) { req_seed = static_cast<uint64_t>(iv); has_seed = true; }
+        } else if (k == "stream") {
+            stream = parse_json_bool(body, pos);
+        } else if (k == "enable_thinking") {
+            if (parse_json_bool_opt(body, pos, &bv)) enable_thinking = bv;
+        } else if (k == "chat_template_kwargs") {
+            const size_t start = pos; skip_json_value(body, pos);
+            std::string_view et;
+            if (extract_raw_field(body.substr(start, pos - start), "enable_thinking", &et)) {
+                et = trim_ascii_ws(et);
+                if (et == "false") enable_thinking = false;
+                else if (et == "true") enable_thinking = true;
+            }
+        } else if (k == "max_reasoning_tokens") {
+            if (parse_json_i64_opt(body, pos, &iv)) {
+                max_reasoning_tokens = static_cast<uint32_t>(std::clamp<int64_t>(iv, 0, INT32_MAX));
+                has_max_reasoning = true;
+            }
+        } else if (k == "response_format") {
+            const size_t start = pos; skip_json_value(body, pos);
+            response_format_raw = body.substr(start, pos - start);
+        } else if (k == "stream_options") {
+            const size_t start = pos; skip_json_value(body, pos);
+            include_usage = extract_bool_field(body.substr(start, pos - start), "include_usage");
+        } else if (k == "mtp") {
+            if (parse_json_i64_opt(body, pos, &iv)) req_mtp = clamp_i64_to_i32(iv, 0, MTP_MAX_DRAFTS);
+        } else if (k == "stop") {
+            parse_stop_field(body, pos, stops);
+        } else {
+            skip_json_value(body, pos);
+        }
+        skip_ws(body, pos);
+        if (pos < body.size() && body[pos] == ',') ++pos;
+    }
+
+    // Fallback to exclusive legacy handler if response_format is constrained, tools need schema repair, or images are present
+    JsonSchema json_schema;
+    bool json_constrained = false;
+    if (!response_format_raw.empty()) {
+        const char* rf_err = nullptr;
+        if (!parse_response_format(response_format_raw, &json_schema, &json_constrained, &rf_err)) {
+            send_error_json(fd, 400, rf_err, "invalid_request_error", slot.small_buf, kSmallBufBytes);
+            return;
+        }
+    }
+    const bool has_images_hint = contains_ignore_case(messages_json, "image_url");
+    if (json_constrained || has_images_hint || (config.constrain_tool_calls && tools_json.size() > 2)) {
+        EngineLock engine_lock;
+        handle_chat_completions(fd, body, engine, tokenizer, config, shared_buffers, prng_state);
+        return;
+    }
+
+    if (messages_json.size() < 2 || messages_json[0] != '[') {
+        send_error_json(fd, 400, "'messages' must be a non-empty array", "invalid_request_error", slot.small_buf, kSmallBufBytes);
+        return;
+    }
+    if (max_tokens < 1) max_tokens = 1;
+    if (!std::isfinite(req_temp) || req_temp < 0.0f) req_temp = 0.0f;
+    if (!std::isfinite(req_top_p) || req_top_p <= 0.0f || req_top_p > 1.0f) req_top_p = 1.0f;
+    if (req_top_k < 0) req_top_k = 0;
+    req_mtp = std::clamp(req_mtp, 0, MTP_MAX_DRAFTS);
+
+    std::vector<int32_t> local_prompt;
+    uint64_t local_prng = 0;
+    {
+        std::lock_guard<std::mutex> tlk(g_tok_mutex);
+        RequestImages req_images{};
+        const ChatEncodeResult enc = encode_chat_template_zero_alloc(
+            tokenizer, messages_json, tools_json, effort, config.keep_history_thinking, enable_thinking, shared_buffers, req_images);
+        if (enc.image_error) {
+            send_error_json(fd, 400, "Failed to fetch or decode image input", "invalid_request_error", slot.small_buf, kSmallBufBytes);
+            return;
+        }
+        if (enc.overflow) {
+            send_error_json(fd, 413, "Rendered prompt exceeds static buffer or max_context", "invalid_request_error", slot.small_buf, kSmallBufBytes);
+            return;
+        }
+        if (enc.prompt_len == 0 || enc.prompt_len >= config.context_tokens_max) {
+            send_error_json(fd, 400, "Prompt empty or exceeds max_context", "invalid_request_error", slot.small_buf, kSmallBufBytes);
+            return;
+        }
+        local_prompt.assign(shared_buffers.prompt_tokens, shared_buffers.prompt_tokens + enc.prompt_len);
+        prng_state = prng_state * 6364136223846793005ULL + 1;
+        local_prng = prng_state ^ clock_monotonic_ns();
+        if (!has_seed) req_seed = local_prng;
+    }
+
+    const uint32_t gen_limit = std::min<uint32_t>(
+        static_cast<uint32_t>(max_tokens),
+        std::min<uint32_t>(static_cast<uint32_t>(kConnGenTokensMax),
+                           config.context_tokens_max - static_cast<uint32_t>(local_prompt.size())));
+
+    char req_id_buf[33];
+    std::memcpy(req_id_buf, "chatcmpl-", 9);
+    fill_random_hex(local_prng, req_id_buf + 9, 24);
+    const std::string_view req_id(req_id_buf, 33);
+    const int64_t created = epoch_seconds();
+
+    InklingStreamParser parser{};
+    parser.init_with_bufs(&tokenizer, config.raw_thinking,
+                          slot.content_buf, kConnContentBytes,
+                          slot.reasoning_buf, kConnReasoningBytes,
+                          slot.tool_raw_buf, kToolRawBytes,
+                          slot.tool_store_buf, kToolStoreBytes, local_prng);
+    if (!enable_thinking) parser.section = InklingSection::Text;
+
+    if (!has_max_reasoning && !(effort == "none" || effort == "minimal" || effort == "low")) {
+        max_reasoning_tokens = static_cast<uint32_t>(std::min<uint64_t>(4ULL * max_reasoning_tokens, INT32_MAX));
+    }
+    LoopGuard loop_guard{};
+    loop_guard.enabled = config.loop_guard;
+    loop_guard.max_reasoning = max_reasoning_tokens;
+    loop_guard.start(slot.gen_tokens, 0);
+
+    const SampleParams sp{req_temp, req_top_p, req_top_k, req_seed};
+
+    if (!stream) {
+        struct NonStreamCtx {
+            InklingStreamParser* parser;
+            const StopList* stops;
+            LoopGuard* guard;
+            size_t scanned_len = 0;
+            bool hit_stop = false;
+            static bool on_token(void* p, int32_t tid) {
+                auto* self = static_cast<NonStreamCtx*>(p);
+                (void)self->parser->feed(tid);
+                if (self->guard->observe(self->parser->section) != LoopGuard::None) {
+                    self->guard->stopped = true;
+                    return false;
+                }
+                if (self->stops->count > 0) {
+                    const std::string_view full = self->parser->content_writer.slice();
+                    const size_t overlap = (self->stops->max_len > 1) ? (self->stops->max_len - 1) : 0;
+                    const size_t scan_from = (self->scanned_len > overlap) ? (self->scanned_len - overlap) : 0;
+                    size_t rel_idx = 0;
+                    if (self->stops->find_first(full.substr(scan_from), &rel_idx)) {
+                        self->parser->content_writer.length = scan_from + rel_idx;
+                        self->hit_stop = true;
+                        return false;
+                    }
+                    self->scanned_len = full.size();
+                }
+                return true;
+            }
+        } ctx{&parser, &stops, &loop_guard};
+
+        const GenerateStats stats = g_scheduler.run_batched(
+            local_prompt.data(), local_prompt.size(), gen_limit, static_cast<uint32_t>(req_mtp),
+            sp, slot.gen_tokens, gen_limit, NonStreamCtx::on_token, &ctx);
+
+        const bool hit_eos = (stats.last_token_id == EOS_TOKEN);
+        const char* finish_reason = (parser.tool_call_count > 0) ? "tool_calls"
+                                  : loop_guard.stopped           ? "length"
+                                  : (ctx.hit_stop || hit_eos)    ? "stop" : "length";
+        const double dec_toks = static_cast<double>(stats.generated_tokens > 0 ? stats.generated_tokens - 1 : 0);
+        const double tps = (stats.decode_ms > 0.0) ? (dec_toks * 1000.0 / stats.decode_ms) : 0.0;
+        const double acc_pct = (stats.total_drafts > 0) ? (100.0 * static_cast<double>(stats.total_accepted) / stats.total_drafts) : 0.0;
+        const double dl = (stats.spec_steps > 0) ? (dec_toks / stats.spec_steps) : 1.0;
+
+        ByteWriter bw(slot.response_buf, kConnResponseBytes);
+        bool ok = true;
+        ok = ok && bw.try_append_slice("{\"id\":");
+        ok = ok && bw.try_append_json_escaped(req_id);
+        ok = ok && bw.try_append_fmt(",\"object\":\"chat.completion\",\"created\":%lld,\"model\":", static_cast<long long>(created));
+        ok = ok && bw.try_append_json_escaped(req_model);
+        ok = ok && bw.try_append_slice(",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
+        if (parser.content_writer.length > 0 || parser.tool_call_count == 0) {
+            ok = ok && bw.try_append_json_escaped(parser.content_writer.slice());
+        } else {
+            ok = ok && bw.try_append_slice("null");
+        }
+        if (parser.reasoning_writer.length > 0) {
+            ok = ok && bw.try_append_slice(",\"reasoning_content\":");
+            ok = ok && bw.try_append_json_escaped(parser.reasoning_writer.slice());
+        }
+        ok = ok && bw.try_append_slice("},\"finish_reason\":");
+        ok = ok && bw.try_append_json_escaped(finish_reason);
+        ok = ok && bw.try_append_fmt(
+            "}],\"usage\":{\"prompt_tokens\":%u,\"completion_tokens\":%u,\"total_tokens\":%u,\"prompt_tokens_details\":{\"cached_tokens\":%u}},"
+            "\"timings\":{\"prefill_ms\":%.2f,\"decode_ms\":%.2f,\"tokens_per_second\":%.2f,\"cached_tokens\":%u,\"spec_acc_pct\":%.1f,\"spec_dl\":%.2f}}",
+            stats.prompt_tokens, stats.generated_tokens, stats.prompt_tokens + stats.generated_tokens, stats.cached_tokens,
+            stats.prefill_ms, stats.decode_ms, tps, stats.cached_tokens, acc_pct, dl);
+        if (!ok) {
+            send_error_json(fd, 500, "Response exceeded buffer", "server_error", slot.small_buf, kSmallBufBytes);
+            return;
+        }
+        send_json_response(fd, 200, bw.slice());
+        return;
+    }
+
+    // --- STREAMING SSE ---
+    if (!send_sse_headers(fd)) return;
+    const ByteWriter frame_prefix = chat_sse_frame_prefix(slot.sse_buf, req_id, created, req_model);
+    if (!send_chat_sse_delta(fd, frame_prefix, DeltaKind::Role, "assistant", nullptr, nullptr)) return;
+
+    struct StreamCtx {
+        int fd;
+        ByteWriter frame_prefix;
+        InklingStreamParser* parser;
+        const StopList* stops;
+        LoopGuard* guard;
+        size_t emitted_len = 0;
+        size_t scanned_len = 0;
+        bool hit_stop = false;
+        bool conn_ok = true;
+
+        static bool on_token(void* p, int32_t tid) {
+            auto* self = static_cast<StreamCtx*>(p);
+            const auto delta = self->parser->feed(tid);
+            const bool loop_hit = self->guard->observe(self->parser->section) != LoopGuard::None;
+            if (loop_hit) self->guard->stopped = true;
+            if (!delta.reasoning.empty()) {
+                if (!send_chat_sse_delta(self->fd, self->frame_prefix, DeltaKind::Reasoning, delta.reasoning, nullptr, nullptr)) {
+                    self->conn_ok = false;
+                    return false;
+                }
+            }
+            if (!delta.content.empty()) {
+                if (self->stops->count > 0) {
+                    const std::string_view full = self->parser->content_writer.slice();
+                    const size_t hold = (self->stops->max_len > 1) ? (self->stops->max_len - 1) : 0;
+                    const size_t scan_from = (self->scanned_len > hold) ? (self->scanned_len - hold) : 0;
+                    size_t rel_idx = 0;
+                    if (self->stops->find_first(full.substr(scan_from), &rel_idx)) {
+                        const size_t idx = scan_from + rel_idx;
+                        if (idx > self->emitted_len) {
+                            (void)send_chat_sse_delta(self->fd, self->frame_prefix, DeltaKind::Content,
+                                                      full.substr(self->emitted_len, idx - self->emitted_len), nullptr, nullptr);
+                        }
+                        self->emitted_len = idx;
+                        self->hit_stop = true;
+                        return false;
+                    }
+                    self->scanned_len = full.size();
+                    if (full.size() > self->emitted_len + hold) {
+                        const size_t send_end = full.size() - hold;
+                        if (!send_chat_sse_delta(self->fd, self->frame_prefix, DeltaKind::Content,
+                                                 full.substr(self->emitted_len, send_end - self->emitted_len), nullptr, nullptr)) {
+                            self->conn_ok = false;
+                            return false;
+                        }
+                        self->emitted_len = send_end;
+                    }
+                } else {
+                    if (!send_chat_sse_delta(self->fd, self->frame_prefix, DeltaKind::Content, delta.content, nullptr, nullptr)) {
+                        self->conn_ok = false;
+                        return false;
+                    }
+                    self->emitted_len = self->parser->content_writer.length;
+                }
+            }
+            return !loop_hit;
+        }
+    } sctx{fd, frame_prefix, &parser, &stops, &loop_guard};
+
+    const GenerateStats stats = g_scheduler.run_batched(
+        local_prompt.data(), local_prompt.size(), gen_limit, static_cast<uint32_t>(req_mtp),
+        sp, slot.gen_tokens, gen_limit, StreamCtx::on_token, &sctx);
+    if (!sctx.conn_ok) return;
+
+    if (stops.count > 0 && !sctx.hit_stop && sctx.emitted_len < parser.content_writer.length) {
+        const std::string_view rem = parser.content_writer.slice().substr(sctx.emitted_len);
+        if (!send_chat_sse_delta(fd, frame_prefix, DeltaKind::Content, rem, nullptr, nullptr)) return;
+    }
+    if (parser.tool_call_count > 0) {
+        if (!send_chat_sse_tool_calls(fd, frame_prefix, parser)) return;
+    }
+
+    const bool hit_eos = (stats.last_token_id == EOS_TOKEN);
+    const char* finish_reason = (parser.tool_call_count > 0) ? "tool_calls"
+                              : loop_guard.stopped           ? "length"
+                              : (sctx.hit_stop || hit_eos)   ? "stop" : "length";
+    (void)send_chat_sse_delta(fd, frame_prefix, DeltaKind::Empty, "", finish_reason, include_usage ? &stats : nullptr);
+    (void)send_all(fd, "data: [DONE]\n\n");
+}
 
 void handle_connection(
     int fd, Engine& engine, const Tokenizer& tokenizer,
@@ -2907,9 +3789,10 @@ void handle_connection(
         ByteWriter bw(slot.small_buf, kSmallBufBytes);
         bw.append_slice("{\"status\":\"ok\",\"model\":");
         bw.append_json_escaped(config.model_name);
-        bw.append_fmt(",\"max_context\":%u,\"max_output_tokens\":%u,\"mtp\":%u,\"engine\":\"squidDGX\",\"busy\":%s,\"queued\":%d}",
-                      config.context_tokens_max, config.max_output_tokens, config.default_mtp,
+        bw.append_fmt(",\"max_context\":%u,\"max_output_tokens\":%u,\"mtp\":%u,\"max_batch\":%u,\"engine\":\"squidDGX\",\"busy\":%s,\"active\":%d,\"queued\":%d}",
+                      config.context_tokens_max, config.max_output_tokens, config.default_mtp, config.max_batch_slots,
                       g_engine_busy.load(std::memory_order_relaxed) ? "true" : "false",
+                      g_engine_active.load(std::memory_order_relaxed),
                       g_engine_waiting.load(std::memory_order_relaxed));
         send_json_response(fd, 200, bw.slice());
         return;
@@ -2937,8 +3820,12 @@ void handle_connection(
     }
 
     if (req.method == "POST" && (req.path == "/v1/chat/completions" || req.path == "/chat/completions")) {
-        EngineLock engine_lock;
-        handle_chat_completions(fd, req.body, engine, tokenizer, config, buffers, prng_state);
+        if (g_scheduler.enabled) {
+            handle_chat_completions_batched(fd, req.body, engine, tokenizer, config, buffers, slot, prng_state);
+        } else {
+            EngineLock engine_lock;
+            handle_chat_completions(fd, req.body, engine, tokenizer, config, buffers, prng_state);
+        }
         return;
     }
 
@@ -3105,14 +3992,22 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
 
     ServerBuffers buffers{};
     buffers.init();
+    g_scheduler.start(engine, config);
 
     uint64_t prng_state = clock_monotonic_ns() ^ 0x9e3779b97f4a7c15ULL;
     if (prng_state == 0) prng_state = 0x9e3779b97f4a7c15ULL;
 
-    printf("[server] squidDGX C++20 OpenAI API listening on http://%.*s:%u/v1 (model=%.*s, ctx=%u, max_out=%u, mtp=%u, zero-malloc=on)\n",
+    printf("[server] squidDGX C++20 OpenAI API listening on http://%.*s:%u/v1 (model=%.*s, ctx=%u, max_out=%u, mtp=%u, max_batch=%u, ramp=%u,%u,%u,%u,%u,%u,%u,%u, chunk=%u, ds_commit=%s)\n",
            static_cast<int>(config.host.size()), config.host.data(), config.port,
            static_cast<int>(config.model_name.size()), config.model_name.data(),
-           config.context_tokens_max, config.max_output_tokens, config.default_mtp);
+           config.context_tokens_max, config.max_output_tokens, config.default_mtp,
+           config.max_batch_slots,
+           config.mtp_ramp.drafts_by_c[1], config.mtp_ramp.drafts_by_c[2],
+           config.mtp_ramp.drafts_by_c[3], config.mtp_ramp.drafts_by_c[4],
+           config.mtp_ramp.drafts_by_c[5], config.mtp_ramp.drafts_by_c[6],
+           config.mtp_ramp.drafts_by_c[7], config.mtp_ramp.drafts_by_c[8],
+           config.mtp_ramp.prefill_chunk_tokens,
+           config.mtp_ramp.commit_dspark_in_batch ? "on" : "off");
     if (semif_fd >= 0) {
         printf("[server] SemIf decision endpoint listening natively on http://%.*s:%u/score (max_prompt_tokens=%u, no sidecar)\n",
                static_cast<int>(config.host.size()), config.host.data(), config.semif_port, config.semif_max_tokens);
@@ -3122,10 +4017,7 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
     ConnSlot slots[kConnSlots];
     std::mutex slots_mu;
     std::atomic<int> active_conns{0};
-    for (auto& sl : slots) {
-        sl.request_buf = alloc_host_zeroed<char>(kRequestBufferBytes);
-        sl.small_buf = alloc_host_zeroed<char>(kSmallBufBytes);
-    }
+    for (auto& sl : slots) sl.init();
 
     timeval sock_timeout{};
     sock_timeout.tv_sec = 30;
@@ -3183,9 +4075,10 @@ int run_openai_server(Engine& engine, const Tokenizer& tokenizer, const ServerCo
     for (int w = 0; w < 300 && active_conns.load(std::memory_order_acquire) > 0; ++w) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    g_scheduler.stop();
     if (active_conns.load(std::memory_order_acquire) == 0) {
         buffers.deinit();
-        for (auto& sl : slots) { free_host(sl.request_buf); free_host(sl.small_buf); }
+        for (auto& sl : slots) sl.deinit();
     }
     int rem_fd = g_listen_fd.exchange(-1, std::memory_order_acq_rel);
     if (rem_fd >= 0) ::close(rem_fd);

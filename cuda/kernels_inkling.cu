@@ -679,7 +679,8 @@ global_attn_bulk_splitk_kernel(
     const __half* __restrict__ v_scale,
     int kv_cap,
     const int32_t* __restrict__ d_pos,
-    float* __restrict__ split_buf) {
+    float* __restrict__ split_buf,
+    const int32_t* __restrict__ page_table) {
     pdl_wait();
     pdl_trigger();
     int pos0 = *d_pos;
@@ -697,7 +698,7 @@ global_attn_bulk_splitk_kernel(
     constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
     run_tc_bulk_splitk<KV_FMT, Q_CNT, QRGS_STRIDE, THREADS>(
         qrgs, k_cache, v_cache, k_scale, v_scale, kv_cap,
-        blockIdx.x, split, t_start, t_end, split_buf);
+        blockIdx.x, split, t_start, t_end, split_buf, page_table);
 }
 
 // ============================================================================
@@ -718,7 +719,8 @@ local_tail_attn_tc_kernel(
     int kv_cap,
     int window,
     const int32_t* __restrict__ d_pos,
-    float* __restrict__ split_buf) {
+    float* __restrict__ split_buf,
+    const int32_t* __restrict__ page_table) {
     constexpr int Q_CNT = GQA_RATIO * B_CONST;
     constexpr int NM = (Q_CNT > 16) ? 2 : 1;
     constexpr int THREADS = (NM == 2) ? 256 : 128;
@@ -789,7 +791,7 @@ local_tail_attn_tc_kernel(
         int t_loc = idx >> 4;
         int sub = idx & 15;
         if (t_loc < tile_len) {
-            int slot = (t0 + t_loc) % kv_cap;
+            int slot = kv_phys_slot(page_table, t0 + t_loc, kv_cap);
             *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) =
                 load_kv_8elems_h2x4<KV_FMT>(k_cache, k_scale, slot, kvh, sub);
         } else {
@@ -948,7 +950,7 @@ local_tail_attn_tc_kernel(
         int t_loc = idx >> 4;
         int sub = idx & 15;
         if (t_loc < tile_len) {
-            int slot = (t0 + t_loc) % kv_cap;
+            int slot = kv_phys_slot(page_table, t0 + t_loc, kv_cap);
             *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) =
                 load_kv_8elems_h2x4<KV_FMT>(v_cache, v_scale, slot, kvh, sub);
         } else {
@@ -1067,6 +1069,429 @@ attn_merge_sink_gate_kernel(
     for (int s = loc_base; s < loc_base + active_local; ++s) {
         g_m = fmaxf(g_m, ld_dep_f32(s_m_in + s));
     }
+
+    float g_d = __expf(sink_logit - g_m);
+    float g_o = 0.0f;
+    for (int s = 0; s < active_bulk; ++s) {
+        float sd = ld_dep_f32(s_d_in + s);
+        if (sd > 0.0f) {
+            float sc = __expf(ld_dep_f32(s_m_in + s) - g_m);
+            g_d += sd * sc;
+            g_o += ld_dep_f32(s_o_in + (size_t)(base_hb + s) * HEAD_DIM + tid) * sc;
+        }
+    }
+    for (int s = loc_base; s < loc_base + active_local; ++s) {
+        float sd = ld_dep_f32(s_d_in + s);
+        if (sd > 0.0f) {
+            float sc = __expf(ld_dep_f32(s_m_in + s) - g_m);
+            g_d += sd * sc;
+            g_o += ld_dep_f32(s_o_in + (size_t)(base_hb + s) * HEAD_DIM + tid) * sc;
+        }
+    }
+
+    float val = (g_o / g_d) * fast_sigmoid(gate_p[tid]);
+    size_t oidx = (size_t)b * Q_DIM + h * HEAD_DIM + tid;
+    if (out_gated) out_gated[oidx] = val;
+    if (out_gated_h) out_gated_h[oidx] = __float2half(val);
+}
+
+// ============================================================================
+// Multi-Sequence Continuous Batching Attention Kernels (3D Grid: blockIdx.z = seq_idx)
+// Supports paged shared global KV pool + per-slot local SWA caches in ONE launch!
+// ============================================================================
+template <int KV_FMT, int MAX_W>
+__global__ void __launch_bounds__((GQA_RATIO * MAX_W > 16) ? 128 : 64)
+global_attn_bulk_splitk_batched_kernel(
+    const float* __restrict__ qrgs,
+    const void* __restrict__ k_cache,
+    const void* __restrict__ v_cache,
+    const __half* __restrict__ k_scale,
+    const __half* __restrict__ v_scale,
+    int kv_cap,
+    const BatchSeqMeta* __restrict__ seq_meta,
+    const int32_t* __restrict__ page_table,
+    float* __restrict__ split_buf) {
+    pdl_wait();
+    pdl_trigger();
+    const BatchSeqMeta sm = seq_meta[blockIdx.z];
+    const int pos0 = sm.pos0;
+    const int tail_start = pos0 - REL_EXTENT + 1;
+    if (tail_start <= 0) return;
+
+    const int split = blockIdx.y;
+    const int chunk = (tail_start + KV_SPLIT_K - 1) / KV_SPLIT_K;
+    const int t_start = split * chunk;
+    if (t_start >= tail_start) return;
+    const int t_end = min(tail_start, t_start + chunk);
+
+    const int32_t* pt = page_table ? (page_table + (size_t)sm.slot_id * MAX_KV_PAGES) : nullptr;
+    constexpr int Q_CNT = GQA_RATIO * MAX_W;
+    constexpr int THREADS = (Q_CNT > 16) ? 128 : 64;
+    constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
+    run_tc_bulk_splitk<KV_FMT, Q_CNT, QRGS_STRIDE, THREADS>(
+        qrgs, k_cache, v_cache, k_scale, v_scale, kv_cap,
+        blockIdx.x, split, t_start, t_end, split_buf, pt, sm.batch_off, GQA_RATIO * sm.width);
+}
+
+template <int KV_FMT, int MAX_W>
+__global__ void __launch_bounds__((GQA_RATIO * MAX_W > 16) ? 256 : 128)
+local_tail_attn_tc_batched_kernel(
+    const float* __restrict__ qrgs,
+    const __nv_bfloat16* __restrict__ rel_proj,
+    const void* __restrict__ k_cache,
+    const void* __restrict__ v_cache,
+    const __half* __restrict__ k_scale,
+    const __half* __restrict__ v_scale,
+    int kv_cap,
+    int window,
+    const BatchSeqMeta* __restrict__ seq_meta,
+    const int32_t* __restrict__ page_table,
+    float* __restrict__ split_buf) {
+    constexpr int Q_CNT_MAX = GQA_RATIO * MAX_W;
+    constexpr int NM = (Q_CNT_MAX > 16) ? 2 : 1;
+    constexpr int THREADS = (NM == 2) ? 256 : 128;
+    constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
+
+    const int kvh = blockIdx.x;
+    const int lsplit = blockIdx.y;
+    const int split_slot = (window == 0) ? (KV_SPLIT_K + lsplit) : lsplit;
+    const int tid = threadIdx.x;
+
+    pdl_wait();
+    pdl_trigger();
+
+    const BatchSeqMeta bsm = seq_meta[blockIdx.z];
+    const int pos0 = bsm.pos0;
+    const int seq_w = bsm.width;
+    const int b_off = bsm.batch_off;
+    const int slot_id = bsm.slot_id;
+    const int q_cnt = GQA_RATIO * seq_w;
+
+    const int win_start = (window > 0) ? max(0, pos0 + 1 - window) : max(0, pos0 - REL_EXTENT + 1);
+    const int win_end = pos0 + seq_w;
+    const int t0 = win_start + lsplit * 64;
+    const int tile_len = min(64, max(0, win_end - t0));
+    if (tile_len <= 0) return;
+
+    const void* kc_ptr = (window > 0)
+        ? static_cast<const void*>(static_cast<const __nv_bfloat16*>(k_cache) + (size_t)slot_id * kv_cap * KV_DIM)
+        : k_cache;
+    const void* vc_ptr = (window > 0)
+        ? static_cast<const void*>(static_cast<const __nv_bfloat16*>(v_cache) + (size_t)slot_id * kv_cap * KV_DIM)
+        : v_cache;
+    const int32_t* pt = (window == 0 && page_table != nullptr)
+        ? (page_table + (size_t)slot_id * MAX_KV_PAGES)
+        : nullptr;
+
+    float* s_m_out = split_buf + SPLIT_M_OFF;
+    float* s_d_out = split_buf + SPLIT_D_OFF;
+    float* s_o_out = split_buf + SPLIT_O_OFF;
+
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int grp = lane >> 2;
+    const int tid4 = lane & 3;
+    const int slice = warp & 3;
+    const int m_tile = warp >> 2;
+
+    __shared__ __half s_r[32][D_REL];
+    __shared__ __half s_rp[72][D_REL];
+    __shared__ union {
+        __half s_kv[64][HEAD_DIM + 8];
+        struct {
+            float m[8][4];
+            float d[8][4];
+            float o[4][8][HEAD_DIM];
+        } red;
+    } smem;
+
+    for (int i = tid; i < q_cnt * D_REL; i += THREADS) {
+        int qi = i >> 4;
+        int k = i & 15;
+        int h = kvh * GQA_RATIO + (qi % GQA_RATIO);
+        int b = b_off + (qi / GQA_RATIO);
+        s_r[qi][k] = __float2half(qrgs[(size_t)b * QRGS_STRIDE + Q_DIM + h * D_REL + k]);
+    }
+
+    int d_min = max(0, pos0 - (t0 + tile_len - 1));
+    int d_max = min(REL_EXTENT - 1, pos0 + seq_w - 1 - t0);
+    int d_span = (d_max >= d_min) ? (d_max - d_min + 1) : 0;
+    for (int i = tid; i < d_span * D_REL; i += THREADS) {
+        int di = i >> 4;
+        int k = i & 15;
+        int dist = d_min + di;
+        s_rp[di][k] = __float2half(__bfloat162float(__ldg(&rel_proj[k * REL_EXTENT + dist])));
+    }
+
+    #pragma unroll
+    for (int idx = tid; idx < 1024; idx += THREADS) {
+        int t_loc = idx >> 4;
+        int sub = idx & 15;
+        if (t_loc < tile_len) {
+            int slot = kv_phys_slot(pt, t0 + t_loc, kv_cap);
+            *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) =
+                load_kv_8elems_h2x4<KV_FMT>(kc_ptr, k_scale, slot, kvh, sub);
+        } else {
+            *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
+        }
+    }
+
+    int q0 = m_tile * 16 + grp;
+    int q1 = m_tile * 16 + grp + 8;
+    const float* qp0 = nullptr;
+    const float* qp1 = nullptr;
+    int pos_q0 = pos0, pos_q1 = pos0;
+    if (q0 < q_cnt) {
+        int h0 = kvh * GQA_RATIO + (q0 % GQA_RATIO);
+        int lb0 = q0 / GQA_RATIO;
+        pos_q0 = pos0 + lb0;
+        qp0 = qrgs + (size_t)(b_off + lb0) * QRGS_STRIDE + h0 * HEAD_DIM;
+    }
+    if (q1 < q_cnt) {
+        int h1 = kvh * GQA_RATIO + (q1 % GQA_RATIO);
+        int lb1 = q1 / GQA_RATIO;
+        pos_q1 = pos0 + lb1;
+        qp1 = qrgs + (size_t)(b_off + lb1) * QRGS_STRIDE + h1 * HEAD_DIM;
+    }
+
+    uint32_t q_reg[8][4];
+    #pragma unroll
+    for (int kt = 0; kt < 8; ++kt) {
+        int k_off = kt * 16;
+        if (qp0) {
+            __half2 h0 = __floats2half2_rn(qp0[k_off + tid4 * 2] * INV_SQRT_HEAD_DIM,
+                                           qp0[k_off + tid4 * 2 + 1] * INV_SQRT_HEAD_DIM);
+            __half2 h2 = __floats2half2_rn(qp0[k_off + tid4 * 2 + 8] * INV_SQRT_HEAD_DIM,
+                                           qp0[k_off + tid4 * 2 + 9] * INV_SQRT_HEAD_DIM);
+            q_reg[kt][0] = *reinterpret_cast<uint32_t*>(&h0);
+            q_reg[kt][2] = *reinterpret_cast<uint32_t*>(&h2);
+        } else {
+            q_reg[kt][0] = 0u;
+            q_reg[kt][2] = 0u;
+        }
+        if (qp1) {
+            __half2 h1 = __floats2half2_rn(qp1[k_off + tid4 * 2] * INV_SQRT_HEAD_DIM,
+                                           qp1[k_off + tid4 * 2 + 1] * INV_SQRT_HEAD_DIM);
+            __half2 h3 = __floats2half2_rn(qp1[k_off + tid4 * 2 + 8] * INV_SQRT_HEAD_DIM,
+                                           qp1[k_off + tid4 * 2 + 9] * INV_SQRT_HEAD_DIM);
+            q_reg[kt][1] = *reinterpret_cast<uint32_t*>(&h1);
+            q_reg[kt][3] = *reinterpret_cast<uint32_t*>(&h3);
+        } else {
+            q_reg[kt][1] = 0u;
+            q_reg[kt][3] = 0u;
+        }
+    }
+    __syncthreads();
+
+    int c0 = tid4 * 2;
+    int c1 = tid4 * 2 + 1;
+    int c4 = tid4 * 2 + 8;
+    int c5 = tid4 * 2 + 9;
+    int t_base = slice * 16;
+    int w_len = min(16, max(0, tile_len - t_base));
+
+    float m0 = -1e30f, m1 = -1e30f;
+    float d0 = 0.0f, d1 = 0.0f;
+    float o[16][4];
+    #pragma unroll
+    for (int nt = 0; nt < 16; ++nt) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.0f;
+
+    uint32_t pa0 = 0u, pa1 = 0u, pa2 = 0u, pa3 = 0u;
+    if (w_len > 0) {
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        float s4 = 0.0f, s5 = 0.0f, s6 = 0.0f, s7 = 0.0f;
+        int k_ld_row = t_base + ((lane & 16) >> 1) + (lane & 7);
+        int k_ld_col = (lane & 8);
+        #pragma unroll
+        for (int kt = 0; kt < 8; ++kt) {
+            uint32_t kb0, kb1, kb2, kb3;
+            ldmatrix_x4(kb0, kb1, kb2, kb3, &smem.s_kv[k_ld_row][kt * 16 + k_ld_col]);
+            mma_m16n8k16_f32_f16(s0, s1, s2, s3,
+                                 q_reg[kt][0], q_reg[kt][1], q_reg[kt][2], q_reg[kt][3],
+                                 kb0, kb1, s0, s1, s2, s3);
+            mma_m16n8k16_f32_f16(s4, s5, s6, s7,
+                                 q_reg[kt][0], q_reg[kt][1], q_reg[kt][2], q_reg[kt][3],
+                                 kb2, kb3, s4, s5, s6, s7);
+        }
+
+        auto apply_rel = [&](float& s, int col, int qi, int pos_q) {
+            if (qi >= q_cnt || col >= w_len) { s = -1e30f; return; }
+            int t = t0 + t_base + col;
+            if (t > pos_q || (window > 0 && t < pos_q + 1 - window)) { s = -1e30f; return; }
+            int dist = pos_q - t;
+            if (dist < REL_EXTENT) {
+                const __half2* rh = reinterpret_cast<const __half2*>(&s_r[qi][0]);
+                const __half2* ph = reinterpret_cast<const __half2*>(&s_rp[dist - d_min][0]);
+                __half2 a0 = __hmul2(rh[0], ph[0]), a1 = __hmul2(rh[1], ph[1]);
+                a0 = __hfma2(rh[2], ph[2], a0); a1 = __hfma2(rh[3], ph[3], a1);
+                a0 = __hfma2(rh[4], ph[4], a0); a1 = __hfma2(rh[5], ph[5], a1);
+                a0 = __hfma2(rh[6], ph[6], a0); a1 = __hfma2(rh[7], ph[7], a1);
+                float2 f = __half22float2(__hadd2(a0, a1));
+                s += (f.x + f.y);
+            }
+        };
+        apply_rel(s0, c0, q0, pos_q0);
+        apply_rel(s1, c1, q0, pos_q0);
+        apply_rel(s4, c4, q0, pos_q0);
+        apply_rel(s5, c5, q0, pos_q0);
+        apply_rel(s2, c0, q1, pos_q1);
+        apply_rel(s3, c1, q1, pos_q1);
+        apply_rel(s6, c4, q1, pos_q1);
+        apply_rel(s7, c5, q1, pos_q1);
+
+        float rmax0 = fmaxf(fmaxf(s0, s1), fmaxf(s4, s5));
+        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffffu, rmax0, 1));
+        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffffu, rmax0, 2));
+        float rmax1 = fmaxf(fmaxf(s2, s3), fmaxf(s6, s7));
+        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffffu, rmax1, 1));
+        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffffu, rmax1, 2));
+
+        float ps0 = (s0 > -1e29f) ? __expf(s0 - rmax0) : 0.0f;
+        float ps1 = (s1 > -1e29f) ? __expf(s1 - rmax0) : 0.0f;
+        float ps4 = (s4 > -1e29f) ? __expf(s4 - rmax0) : 0.0f;
+        float ps5 = (s5 > -1e29f) ? __expf(s5 - rmax0) : 0.0f;
+        float ps2 = (s2 > -1e29f) ? __expf(s2 - rmax1) : 0.0f;
+        float ps3 = (s3 > -1e29f) ? __expf(s3 - rmax1) : 0.0f;
+        float ps6 = (s6 > -1e29f) ? __expf(s6 - rmax1) : 0.0f;
+        float ps7 = (s7 > -1e29f) ? __expf(s7 - rmax1) : 0.0f;
+
+        float rsum0 = ps0 + ps1 + ps4 + ps5;
+        rsum0 += __shfl_xor_sync(0xffffffffu, rsum0, 1);
+        rsum0 += __shfl_xor_sync(0xffffffffu, rsum0, 2);
+        float rsum1 = ps2 + ps3 + ps6 + ps7;
+        rsum1 += __shfl_xor_sync(0xffffffffu, rsum1, 1);
+        rsum1 += __shfl_xor_sync(0xffffffffu, rsum1, 2);
+        m0 = rmax0; d0 = rsum0;
+        m1 = rmax1; d1 = rsum1;
+
+        __half2 hp0 = __floats2half2_rn(ps0, ps1);
+        __half2 hp1 = __floats2half2_rn(ps2, ps3);
+        __half2 hp2 = __floats2half2_rn(ps4, ps5);
+        __half2 hp3 = __floats2half2_rn(ps6, ps7);
+        pa0 = *reinterpret_cast<uint32_t*>(&hp0);
+        pa1 = *reinterpret_cast<uint32_t*>(&hp1);
+        pa2 = *reinterpret_cast<uint32_t*>(&hp2);
+        pa3 = *reinterpret_cast<uint32_t*>(&hp3);
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int idx = tid; idx < 1024; idx += THREADS) {
+        int t_loc = idx >> 4;
+        int sub = idx & 15;
+        if (t_loc < tile_len) {
+            int slot = kv_phys_slot(pt, t0 + t_loc, kv_cap);
+            *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) =
+                load_kv_8elems_h2x4<KV_FMT>(vc_ptr, v_scale, slot, kvh, sub);
+        } else {
+            *reinterpret_cast<uint4*>(&smem.s_kv[t_loc][sub * 8]) = make_uint4(0, 0, 0, 0);
+        }
+    }
+    __syncthreads();
+
+    if (w_len > 0) {
+        int v_ld_row = t_base + (lane & 15);
+        #pragma unroll
+        for (int nt = 0; nt < 16; ++nt) {
+            uint32_t vb0, vb1;
+            ldmatrix_x2_trans(vb0, vb1, &smem.s_kv[v_ld_row][nt * 8]);
+            mma_m16n8k16_f32_f16(o[nt][0], o[nt][1], o[nt][2], o[nt][3],
+                                 pa0, pa1, pa2, pa3,
+                                 vb0, vb1,
+                                 o[nt][0], o[nt][1], o[nt][2], o[nt][3]);
+        }
+    }
+    __syncthreads();
+
+    for (int mt = 0; mt < NM; ++mt) {
+        for (int half_m = 0; half_m < 2; ++half_m) {
+            if (mt * 16 + half_m * 8 >= q_cnt) break;
+            if (m_tile == mt) {
+                if (tid4 == 0) {
+                    smem.red.m[grp][slice] = (half_m == 0) ? m0 : m1;
+                    smem.red.d[grp][slice] = (half_m == 0) ? d0 : d1;
+                }
+                #pragma unroll
+                for (int nt = 0; nt < 16; ++nt) {
+                    smem.red.o[slice][grp][nt * 8 + c0] = (half_m == 0) ? o[nt][0] : o[nt][2];
+                    smem.red.o[slice][grp][nt * 8 + c1] = (half_m == 0) ? o[nt][1] : o[nt][3];
+                }
+            }
+            __syncthreads();
+
+            for (int i = tid; i < 8 * HEAD_DIM; i += THREADS) {
+                int qi = i >> 7;
+                int dim = i & 127;
+                int q_glob = mt * 16 + half_m * 8 + qi;
+                if (q_glob < q_cnt) {
+                    int gqa = q_glob % GQA_RATIO;
+                    int b = b_off + (q_glob / GQA_RATIO);
+                    int h = kvh * GQA_RATIO + gqa;
+                    int idx = (h * 8 + b) * KV_TOTAL_SPLITS + split_slot;
+                    float gm = fmaxf(fmaxf(smem.red.m[qi][0], smem.red.m[qi][1]),
+                                     fmaxf(smem.red.m[qi][2], smem.red.m[qi][3]));
+                    float gd = 0.0f, go = 0.0f;
+                    #pragma unroll
+                    for (int s = 0; s < 4; ++s) {
+                        if (smem.red.d[qi][s] > 0.0f) {
+                            float sc = __expf(smem.red.m[qi][s] - gm);
+                            gd += smem.red.d[qi][s] * sc;
+                            go += smem.red.o[s][qi][dim] * sc;
+                        }
+                    }
+                    if (dim == 0) { s_m_out[idx] = gm; s_d_out[idx] = gd; }
+                    s_o_out[(size_t)idx * HEAD_DIM + dim] = go;
+                }
+            }
+            __syncthreads();
+        }
+    }
+}
+
+__global__ void __launch_bounds__(128)
+attn_merge_sink_gate_batched_kernel(
+    const float* __restrict__ qrgs,
+    const float* __restrict__ split_buf,
+    float* __restrict__ out_gated,
+    __half* __restrict__ out_gated_h,
+    int window,
+    const BatchSeqMeta* __restrict__ seq_meta,
+    const BatchTokenMeta* __restrict__ tok_meta) {
+    pdl_wait();
+    pdl_trigger();
+    const int h = blockIdx.x;
+    const int b = blockIdx.y;
+    const int tid = threadIdx.x;
+
+    constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
+    const float* qrgs_b = qrgs + (size_t)b * QRGS_STRIDE;
+    const float* gate_p = qrgs_b + Q_DIM + R_DIM + h * HEAD_DIM;
+    const float sink_logit = qrgs_b[Q_DIM + R_DIM + Q_DIM + h];
+
+    const int base_hb = (h * 8 + b) * KV_TOTAL_SPLITS;
+    const float* s_m_in = split_buf + SPLIT_M_OFF + base_hb;
+    const float* s_d_in = split_buf + SPLIT_D_OFF + base_hb;
+    const float* s_o_in = split_buf + SPLIT_O_OFF;
+
+    const BatchSeqMeta sm = seq_meta[tok_meta[b].seq_idx];
+    const int pos0 = sm.pos0;
+    const int win_start = (window > 0) ? max(0, pos0 + 1 - window) : max(0, pos0 - REL_EXTENT + 1);
+    const int win_end = pos0 + sm.width;
+    const int active_local = min(KV_LOCAL_SPLITS, max(0, (win_end - win_start + 63) >> 6));
+
+    int active_bulk = 0;
+    if (window == 0) {
+        const int tail_start = pos0 - REL_EXTENT + 1;
+        if (tail_start > 0) {
+            const int chunk = (tail_start + KV_SPLIT_K - 1) / KV_SPLIT_K;
+            active_bulk = min(KV_SPLIT_K, (tail_start + chunk - 1) / chunk);
+        }
+    }
+
+    const int loc_base = (window == 0) ? KV_SPLIT_K : 0;
+    float g_m = sink_logit;
+    for (int s = 0; s < active_bulk; ++s) g_m = fmaxf(g_m, ld_dep_f32(s_m_in + s));
+    for (int s = loc_base; s < loc_base + active_local; ++s) g_m = fmaxf(g_m, ld_dep_f32(s_m_in + s));
 
     float g_d = __expf(sink_logit - g_m);
     float g_o = 0.0f;
@@ -1624,15 +2049,15 @@ __device__ __forceinline__ float4 sconv_apply_f4(
     const float* __restrict__ src,
     const __nv_bfloat16* __restrict__ sconv_w,
     float* __restrict__ ring,
-    int b, int p, int c4, bool write_ring) {
+    int b, int lo, int p, int c4, bool write_ring) {
     float4 cur = *reinterpret_cast<const float4*>(src + (size_t)b * HIDDEN + c4);
     float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 t2 = (b >= 1) ? *reinterpret_cast<const float4*>(src + (size_t)(b - 1) * HIDDEN + c4)
-                         : ((p >= 1) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 1) & 15) * HIDDEN + c4) : z4);
-    float4 t1 = (b >= 2) ? *reinterpret_cast<const float4*>(src + (size_t)(b - 2) * HIDDEN + c4)
-                         : ((p >= 2) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 2) & 15) * HIDDEN + c4) : z4);
-    float4 t0 = (b >= 3) ? *reinterpret_cast<const float4*>(src + (size_t)(b - 3) * HIDDEN + c4)
-                         : ((p >= 3) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 3) & 15) * HIDDEN + c4) : z4);
+    float4 t2 = (lo >= 1) ? *reinterpret_cast<const float4*>(src + (size_t)(b - 1) * HIDDEN + c4)
+                          : ((p >= 1) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 1) & 15) * HIDDEN + c4) : z4);
+    float4 t1 = (lo >= 2) ? *reinterpret_cast<const float4*>(src + (size_t)(b - 2) * HIDDEN + c4)
+                          : ((p >= 2) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 2) & 15) * HIDDEN + c4) : z4);
+    float4 t0 = (lo >= 3) ? *reinterpret_cast<const float4*>(src + (size_t)(b - 3) * HIDDEN + c4)
+                          : ((p >= 3) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 3) & 15) * HIDDEN + c4) : z4);
     if (write_ring) {
         *reinterpret_cast<float4*>(ring + (size_t)(p & 15) * HIDDEN + c4) = cur;
     }
@@ -1671,15 +2096,15 @@ __device__ __forceinline__ float4 sconv_apply_f4_slotted(
     bool is_slotted,
     const __nv_bfloat16* __restrict__ sconv_w,
     float* __restrict__ ring,
-    int b, int p, int c4, bool write_ring) {
+    int b, int lo, int p, int c4, bool write_ring) {
     float4 cur = load_moe_f4(src, b, c4, is_slotted);
     float4 z4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    float4 t2 = (b >= 1) ? load_moe_f4(src, b - 1, c4, is_slotted)
-                         : ((p >= 1) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 1) & 15) * HIDDEN + c4) : z4);
-    float4 t1 = (b >= 2) ? load_moe_f4(src, b - 2, c4, is_slotted)
-                         : ((p >= 2) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 2) & 15) * HIDDEN + c4) : z4);
-    float4 t0 = (b >= 3) ? load_moe_f4(src, b - 3, c4, is_slotted)
-                         : ((p >= 3) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 3) & 15) * HIDDEN + c4) : z4);
+    float4 t2 = (lo >= 1) ? load_moe_f4(src, b - 1, c4, is_slotted)
+                          : ((p >= 1) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 1) & 15) * HIDDEN + c4) : z4);
+    float4 t1 = (lo >= 2) ? load_moe_f4(src, b - 2, c4, is_slotted)
+                          : ((p >= 2) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 2) & 15) * HIDDEN + c4) : z4);
+    float4 t0 = (lo >= 3) ? load_moe_f4(src, b - 3, c4, is_slotted)
+                          : ((p >= 3) ? *reinterpret_cast<const float4*>(ring + (size_t)((p - 3) & 15) * HIDDEN + c4) : z4);
     if (write_ring) {
         *reinterpret_cast<float4*>(ring + (size_t)(p & 15) * HIDDEN + c4) = cur;
     }
@@ -1722,7 +2147,9 @@ mega_global_sconv_prep_store_kernel(
     void* __restrict__ v_cache,
     __half* __restrict__ k_scale,
     __half* __restrict__ v_scale,
-    int kv_cap, const int32_t* __restrict__ d_pos) {
+    int kv_cap, const int32_t* __restrict__ d_pos,
+    const BatchTokenMeta* __restrict__ tok_meta,
+    const int32_t* __restrict__ page_table) {
     int kind_id = blockIdx.x;
     int b = blockIdx.y;
     int tid = threadIdx.x;
@@ -1730,7 +2157,12 @@ mega_global_sconv_prep_store_kernel(
     int lane = tid & 31;
     pdl_wait();
     pdl_trigger();
-    int p = (*d_pos) + b;
+    const int slot_id = tok_meta ? tok_meta[b].slot_id : 0;
+    const int p = tok_meta ? tok_meta[b].pos : ((*d_pos) + b);
+    const int lo = tok_meta ? tok_meta[b].local_off : b;
+    float* kr_slot = k_ring + (size_t)slot_id * SCONV_RING_SLOTS * KV_DIM;
+    float* vr_slot = v_ring + (size_t)slot_id * SCONV_RING_SLOTS * KV_DIM;
+    const int32_t* pt = page_table ? (page_table + (size_t)slot_id * MAX_KV_PAGES) : nullptr;
     float ratio = fmaxf(float(p + 1) / float(LOG_SCALE_FLOOR), 1.0f);
     float tau = 1.0f + LOG_SCALE_ALPHA * logf(ratio);
     constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
@@ -1783,10 +2215,10 @@ mega_global_sconv_prep_store_kernel(
 
         int c = h * HEAD_DIM + tid;
         float cur = k_proj[(size_t)b * KV_DIM + c];
-        float h1 = (b >= 1) ? k_proj[(size_t)(b - 1) * KV_DIM + c] : ((p >= 1) ? k_ring[((p - 1) & 15) * KV_DIM + c] : 0.0f);
-        float h2 = (b >= 2) ? k_proj[(size_t)(b - 2) * KV_DIM + c] : ((p >= 2) ? k_ring[((p - 2) & 15) * KV_DIM + c] : 0.0f);
-        float h3 = (b >= 3) ? k_proj[(size_t)(b - 3) * KV_DIM + c] : ((p >= 3) ? k_ring[((p - 3) & 15) * KV_DIM + c] : 0.0f);
-        k_ring[(p & 15) * KV_DIM + c] = cur;
+        float h1 = (lo >= 1) ? k_proj[(size_t)(b - 1) * KV_DIM + c] : ((p >= 1) ? kr_slot[((p - 1) & 15) * KV_DIM + c] : 0.0f);
+        float h2 = (lo >= 2) ? k_proj[(size_t)(b - 2) * KV_DIM + c] : ((p >= 2) ? kr_slot[((p - 2) & 15) * KV_DIM + c] : 0.0f);
+        float h3 = (lo >= 3) ? k_proj[(size_t)(b - 3) * KV_DIM + c] : ((p >= 3) ? kr_slot[((p - 3) & 15) * KV_DIM + c] : 0.0f);
+        kr_slot[(p & 15) * KV_DIM + c] = cur;
         float acc = cur * (__bfloat162float(k_sconv_w[0 * KV_DIM + c]) + s_dt[0])
                   + h1  * (__bfloat162float(k_sconv_w[1 * KV_DIM + c]) + s_dt[1])
                   + h2  * (__bfloat162float(k_sconv_w[2 * KV_DIM + c]) + s_dt[2])
@@ -1797,7 +2229,7 @@ mega_global_sconv_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
         __syncthreads();
-        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, k_cache, k_scale, sm);
+        store_kv_head_128<KV_FMT>(val * factor, kv_phys_slot(pt, p, kv_cap), h, tid, k_cache, k_scale, sm);
     } else {
         int h = kind_id - 56;
         const uint4* wr = reinterpret_cast<const uint4*>(v_sconv_proj + (size_t)(h * 4 + warp) * HIDDEN);
@@ -1823,10 +2255,10 @@ mega_global_sconv_prep_store_kernel(
 
         int c = h * HEAD_DIM + tid;
         float cur = v_proj[(size_t)b * KV_DIM + c];
-        float h1 = (b >= 1) ? v_proj[(size_t)(b - 1) * KV_DIM + c] : ((p >= 1) ? v_ring[((p - 1) & 15) * KV_DIM + c] : 0.0f);
-        float h2 = (b >= 2) ? v_proj[(size_t)(b - 2) * KV_DIM + c] : ((p >= 2) ? v_ring[((p - 2) & 15) * KV_DIM + c] : 0.0f);
-        float h3 = (b >= 3) ? v_proj[(size_t)(b - 3) * KV_DIM + c] : ((p >= 3) ? v_ring[((p - 3) & 15) * KV_DIM + c] : 0.0f);
-        v_ring[(p & 15) * KV_DIM + c] = cur;
+        float h1 = (lo >= 1) ? v_proj[(size_t)(b - 1) * KV_DIM + c] : ((p >= 1) ? vr_slot[((p - 1) & 15) * KV_DIM + c] : 0.0f);
+        float h2 = (lo >= 2) ? v_proj[(size_t)(b - 2) * KV_DIM + c] : ((p >= 2) ? vr_slot[((p - 2) & 15) * KV_DIM + c] : 0.0f);
+        float h3 = (lo >= 3) ? v_proj[(size_t)(b - 3) * KV_DIM + c] : ((p >= 3) ? vr_slot[((p - 3) & 15) * KV_DIM + c] : 0.0f);
+        vr_slot[(p & 15) * KV_DIM + c] = cur;
         float acc = cur * (__bfloat162float(v_sconv_w[0 * KV_DIM + c]) + s_dt[0])
                   + h1  * (__bfloat162float(v_sconv_w[1 * KV_DIM + c]) + s_dt[1])
                   + h2  * (__bfloat162float(v_sconv_w[2 * KV_DIM + c]) + s_dt[2])
@@ -1837,7 +2269,7 @@ mega_global_sconv_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
         __syncthreads();
-        store_kv_head_128<KV_FMT>(val * factor, p % kv_cap, h, tid, v_cache, v_scale, sm);
+        store_kv_head_128<KV_FMT>(val * factor, kv_phys_slot(pt, p, kv_cap), h, tid, v_cache, v_scale, sm);
     }
 }
 
@@ -1857,14 +2289,20 @@ mega_local_sconv_prep_store_kernel(
     const __nv_bfloat16* __restrict__ rel_clip_scale,
     __nv_bfloat16* __restrict__ k_cache,
     __nv_bfloat16* __restrict__ v_cache,
-    int kv_cap, const int32_t* __restrict__ d_pos) {
+    int kv_cap, const int32_t* __restrict__ d_pos,
+    const BatchTokenMeta* __restrict__ tok_meta) {
     int kind_id = blockIdx.x;
     int b = blockIdx.y;
     int tid = threadIdx.x;
     pdl_wait();
     pdl_trigger();
-    int pos0 = *d_pos;
-    int p = pos0 + b;
+    const int slot_id = tok_meta ? tok_meta[b].slot_id : 0;
+    const int p = tok_meta ? tok_meta[b].pos : ((*d_pos) + b);
+    const int lo = tok_meta ? tok_meta[b].local_off : b;
+    float* kr_slot = k_ring + (size_t)slot_id * SCONV_RING_SLOTS * KV_DIM;
+    float* vr_slot = v_ring + (size_t)slot_id * SCONV_RING_SLOTS * KV_DIM;
+    __nv_bfloat16* kc_slot = k_cache + (size_t)slot_id * kv_cap * KV_DIM;
+    __nv_bfloat16* vc_slot = v_cache + (size_t)slot_id * kv_cap * KV_DIM;
     constexpr int QRGS_STRIDE = Q_DIM + R_DIM + Q_DIM + NUM_HEADS;
     __shared__ float sm[4];
     __shared__ float factor;
@@ -1892,10 +2330,10 @@ mega_local_sconv_prep_store_kernel(
         int h = kind_id - 48;
         int c = h * HEAD_DIM + tid;
         float cur = k_proj[(size_t)b * KV_DIM + c];
-        float t2 = (b >= 1) ? k_proj[(size_t)(b - 1) * KV_DIM + c] : ((p >= 1) ? k_ring[((p - 1) & 15) * KV_DIM + c] : 0.0f);
-        float t1 = (b >= 2) ? k_proj[(size_t)(b - 2) * KV_DIM + c] : ((p >= 2) ? k_ring[((p - 2) & 15) * KV_DIM + c] : 0.0f);
-        float t0 = (b >= 3) ? k_proj[(size_t)(b - 3) * KV_DIM + c] : ((p >= 3) ? k_ring[((p - 3) & 15) * KV_DIM + c] : 0.0f);
-        k_ring[(p & 15) * KV_DIM + c] = cur;
+        float t2 = (lo >= 1) ? k_proj[(size_t)(b - 1) * KV_DIM + c] : ((p >= 1) ? kr_slot[((p - 1) & 15) * KV_DIM + c] : 0.0f);
+        float t1 = (lo >= 2) ? k_proj[(size_t)(b - 2) * KV_DIM + c] : ((p >= 2) ? kr_slot[((p - 2) & 15) * KV_DIM + c] : 0.0f);
+        float t0 = (lo >= 3) ? k_proj[(size_t)(b - 3) * KV_DIM + c] : ((p >= 3) ? kr_slot[((p - 3) & 15) * KV_DIM + c] : 0.0f);
+        kr_slot[(p & 15) * KV_DIM + c] = cur;
         float val = (__bfloat162float(k_sconv_w[c * 4 + 0]) * t0
                    + __bfloat162float(k_sconv_w[c * 4 + 1]) * t1
                    + __bfloat162float(k_sconv_w[c * 4 + 2]) * t2
@@ -1905,15 +2343,15 @@ mega_local_sconv_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = fminf(QK_CLIP / (sqrtf(sm[0] + sm[1] + sm[2] + sm[3]) + 1e-6f), 1.0f);
         __syncthreads();
-        k_cache[(size_t)(p % kv_cap) * KV_DIM + c] = __float2bfloat16(val * factor);
+        kc_slot[(size_t)(p % kv_cap) * KV_DIM + c] = __float2bfloat16(val * factor);
     } else {
         int h = kind_id - 56;
         int c = h * HEAD_DIM + tid;
         float cur = v_proj[(size_t)b * KV_DIM + c];
-        float t2 = (b >= 1) ? v_proj[(size_t)(b - 1) * KV_DIM + c] : ((p >= 1) ? v_ring[((p - 1) & 15) * KV_DIM + c] : 0.0f);
-        float t1 = (b >= 2) ? v_proj[(size_t)(b - 2) * KV_DIM + c] : ((p >= 2) ? v_ring[((p - 2) & 15) * KV_DIM + c] : 0.0f);
-        float t0 = (b >= 3) ? v_proj[(size_t)(b - 3) * KV_DIM + c] : ((p >= 3) ? v_ring[((p - 3) & 15) * KV_DIM + c] : 0.0f);
-        v_ring[(p & 15) * KV_DIM + c] = cur;
+        float t2 = (lo >= 1) ? v_proj[(size_t)(b - 1) * KV_DIM + c] : ((p >= 1) ? vr_slot[((p - 1) & 15) * KV_DIM + c] : 0.0f);
+        float t1 = (lo >= 2) ? v_proj[(size_t)(b - 2) * KV_DIM + c] : ((p >= 2) ? vr_slot[((p - 2) & 15) * KV_DIM + c] : 0.0f);
+        float t0 = (lo >= 3) ? v_proj[(size_t)(b - 3) * KV_DIM + c] : ((p >= 3) ? vr_slot[((p - 3) & 15) * KV_DIM + c] : 0.0f);
+        vr_slot[(p & 15) * KV_DIM + c] = cur;
         float val = (__bfloat162float(v_sconv_w[c * 4 + 0]) * t0
                    + __bfloat162float(v_sconv_w[c * 4 + 1]) * t1
                    + __bfloat162float(v_sconv_w[c * 4 + 2]) * t2
@@ -1923,7 +2361,7 @@ mega_local_sconv_prep_store_kernel(
         __syncthreads();
         if (tid == 0) factor = rsqrtf((sm[0] + sm[1] + sm[2] + sm[3]) / float(HEAD_DIM) + RMS_EPS);
         __syncthreads();
-        v_cache[(size_t)(p % kv_cap) * KV_DIM + c] = __float2bfloat16(val * factor);
+        vc_slot[(size_t)(p % kv_cap) * KV_DIM + c] = __float2bfloat16(val * factor);
     }
 }
 
@@ -1980,7 +2418,8 @@ mega_attn_post_mlp_in_kernel(
     const int32_t* __restrict__ d_pos,
     const float* __restrict__ abl_r,
     const float* __restrict__ abl_d,
-    const float* __restrict__ abl_p) {
+    const float* __restrict__ abl_p,
+    const BatchTokenMeta* __restrict__ tok_meta) {
     int b = blockIdx.x;
     int tid = threadIdx.x; // 0..575
     int lane = tid & 31;
@@ -1988,7 +2427,10 @@ mega_attn_post_mlp_in_kernel(
     int c4 = tid << 2;     // 0, 4, ..., 2300
     pdl_wait();
     pdl_trigger();
-    int p = (*d_pos) + b;
+    const int slot_id = tok_meta ? tok_meta[b].slot_id : 0;
+    const int p = tok_meta ? tok_meta[b].pos : ((*d_pos) + b);
+    const int lo = tok_meta ? tok_meta[b].local_off : b;
+    float* ring_slot = attn_ring + (size_t)slot_id * SCONV_RING_SLOTS * HIDDEN;
     int n_blocks = block_count_before + (is_boundary ? 1 : 0);
     int n_cand = n_blocks + 1;
 
@@ -2001,7 +2443,7 @@ mega_attn_post_mlp_in_kernel(
     float* blk_b = blocks + (size_t)b * 4 * HIDDEN;
 
     // 1. Vectorized attn_sconv + optional runtime-gated ablation + block copy/residual -> r_mp in registers!
-    float4 ao = sconv_apply_f4(o_proj, attn_sconv_w, attn_ring, b, p, c4, true);
+    float4 ao = sconv_apply_f4(o_proj, attn_sconv_w, ring_slot, b, lo, p, c4, true);
     ao = apply_ablation_576(ao, abl_r, abl_d, abl_p, c4, lane, warp, sm, sm_abl, &inv_rms);
     float4 rv;
     if (is_boundary) {
@@ -2105,7 +2547,8 @@ mega_mlp_post_res_kernel(
     const int32_t* __restrict__ d_pos,
     const float* __restrict__ abl_r,
     const float* __restrict__ abl_d,
-    const float* __restrict__ abl_p) {
+    const float* __restrict__ abl_p,
+    const BatchTokenMeta* __restrict__ tok_meta) {
     int b = blockIdx.x;
     int tid = threadIdx.x;
     int lane = tid & 31;
@@ -2113,11 +2556,14 @@ mega_mlp_post_res_kernel(
     int c4 = tid << 2;
     pdl_wait();
     pdl_trigger();
-    int p = (*d_pos) + b;
+    const int slot_id = tok_meta ? tok_meta[b].slot_id : 0;
+    const int p = tok_meta ? tok_meta[b].pos : ((*d_pos) + b);
+    const int lo = tok_meta ? tok_meta[b].local_off : b;
+    float* ring_slot = mlp_ring + (size_t)slot_id * SCONV_RING_SLOTS * HIDDEN;
     __shared__ float sm_r[18];
     __shared__ float sm_d[18];
     __shared__ float s_coeff;
-    float4 ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, b, p, c4, true);
+    float4 ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, mlp_sconv_w, ring_slot, b, lo, p, c4, true);
     ff = apply_ablation_576(ff, abl_r, abl_d, abl_p, c4, lane, warp, sm_r, sm_d, &s_coeff);
     float4 res = *reinterpret_cast<const float4*>(residual + (size_t)b * HIDDEN + c4);
     *reinterpret_cast<float4*>(hidden_out + (size_t)b * HIDDEN + c4) =
@@ -2369,7 +2815,8 @@ mega_mlp_post_next_depth_norm_kernel(
     const int32_t* __restrict__ d_pos,
     const float* __restrict__ abl_r,
     const float* __restrict__ abl_d,
-    const float* __restrict__ abl_p) {
+    const float* __restrict__ abl_p,
+    const BatchTokenMeta* __restrict__ tok_meta) {
     int b = blockIdx.x;
     int s = blockIdx.y;
     int tid = threadIdx.x; // 0..575
@@ -2378,7 +2825,10 @@ mega_mlp_post_next_depth_norm_kernel(
     int c4 = tid << 2;     // 0, 4, ..., 2300
     pdl_wait();
     pdl_trigger();
-    int p = (*d_pos) + b;
+    const int slot_id = tok_meta ? tok_meta[b].slot_id : 0;
+    const int p = tok_meta ? tok_meta[b].pos : ((*d_pos) + b);
+    const int lo = tok_meta ? tok_meta[b].local_off : b;
+    float* ring_slot = prev_mlp_ring + (size_t)slot_id * SCONV_RING_SLOTS * HIDDEN;
 
     __shared__ float sm[18];
     __shared__ float sm_abl[18];
@@ -2387,7 +2837,7 @@ mega_mlp_post_next_depth_norm_kernel(
     __shared__ float inv_rms;
 
     // 1. Vectorized mlp_sconv (with deterministic 8-slot MoE sum when B>1!) + optional ablation + residual add -> hv in regs!
-    float4 ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, prev_mlp_ring, b, p, c4, s == 0);
+    float4 ff = sconv_apply_f4_slotted(moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, ring_slot, b, lo, p, c4, s == 0);
     ff = apply_ablation_576(ff, abl_r, abl_d, abl_p, c4, lane, warp, sm, sm_abl, &inv_rms);
     float4 res = *reinterpret_cast<const float4*>(residual + (size_t)b * HIDDEN + c4);
     float4 hv = make_float4(res.x + ff.x, res.y + ff.y, res.z + ff.z, res.w + ff.w);
@@ -2609,15 +3059,15 @@ static void dispatch_tc_attn_b(
     const void* k_cache, const void* v_cache,
     const __half* k_scale, const __half* v_scale,
     float* split_buf, float* out_gated, __half* out_gated_h,
-    int kv_cap, int window, const int32_t* d_pos, cudaStream_t stream) {
+    int kv_cap, int window, const int32_t* d_pos, const int32_t* page_table, cudaStream_t stream) {
     constexpr int BULK_THREADS  = (GQA_RATIO * B_CONST > 16) ? 128 : 64;
     constexpr int LOCAL_THREADS = (GQA_RATIO * B_CONST > 16) ? 256 : 128;
     if (window == 0) {
         launch_pdl(global_attn_bulk_splitk_kernel<KV_FMT, B_CONST>, dim3(NUM_KV_HEADS, KV_SPLIT_K), BULK_THREADS, stream,
-            qrgs, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos, split_buf);
+            qrgs, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos, split_buf, page_table);
     }
     launch_pdl(local_tail_attn_tc_kernel<KV_FMT, B_CONST>, dim3(NUM_KV_HEADS, KV_LOCAL_SPLITS), LOCAL_THREADS, stream,
-        qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, kv_cap, window, d_pos, split_buf);
+        qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, kv_cap, window, d_pos, split_buf, (window == 0) ? page_table : nullptr);
     launch_pdl(attn_merge_sink_gate_kernel, dim3(NUM_HEADS, B_CONST), HEAD_DIM, stream,
         qrgs, split_buf, out_gated, out_gated_h, window, B_CONST, d_pos);
 }
@@ -2628,17 +3078,17 @@ static void dispatch_relative_attention_fmt(
     const void* k_cache, const void* v_cache,
     const __half* k_scale, const __half* v_scale,
     float* split_buf, float* out_gated, __half* out_gated_h,
-    int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream) {
+    int kv_cap, int window, int B, const int32_t* d_pos, const int32_t* page_table, cudaStream_t stream) {
     if (split_buf != nullptr) {
         switch (B) {
-            case 1: dispatch_tc_attn_b<KV_FMT, 1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 2: dispatch_tc_attn_b<KV_FMT, 2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 3: dispatch_tc_attn_b<KV_FMT, 3>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 4: dispatch_tc_attn_b<KV_FMT, 4>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 5: dispatch_tc_attn_b<KV_FMT, 5>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 6: dispatch_tc_attn_b<KV_FMT, 6>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 7: dispatch_tc_attn_b<KV_FMT, 7>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
-            case 8: dispatch_tc_attn_b<KV_FMT, 8>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, stream); break;
+            case 1: dispatch_tc_attn_b<KV_FMT, 1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, page_table, stream); break;
+            case 2: dispatch_tc_attn_b<KV_FMT, 2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, page_table, stream); break;
+            case 3: dispatch_tc_attn_b<KV_FMT, 3>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, page_table, stream); break;
+            case 4: dispatch_tc_attn_b<KV_FMT, 4>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, page_table, stream); break;
+            case 5: dispatch_tc_attn_b<KV_FMT, 5>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, page_table, stream); break;
+            case 6: dispatch_tc_attn_b<KV_FMT, 6>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, page_table, stream); break;
+            case 7: dispatch_tc_attn_b<KV_FMT, 7>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, page_table, stream); break;
+            case 8: dispatch_tc_attn_b<KV_FMT, 8>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, d_pos, page_table, stream); break;
         }
         return;
     }
@@ -2651,13 +3101,76 @@ void launch_relative_attention_gated(
     const void* k_cache, const void* v_cache,
     const __half* k_scale, const __half* v_scale,
     KVFormat kv_fmt, float* split_buf, float* out_gated, __half* out_gated_h,
-    int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream) {
+    int kv_cap, int window, int B, const int32_t* d_pos, cudaStream_t stream,
+    const int32_t* page_table) {
     if (kv_fmt == KVFormat::FP8) {
-        dispatch_relative_attention_fmt<1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, stream);
+        dispatch_relative_attention_fmt<1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, page_table, stream);
     } else if (kv_fmt == KVFormat::Q4) {
-        dispatch_relative_attention_fmt<2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, stream);
+        dispatch_relative_attention_fmt<2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, page_table, stream);
     } else {
-        dispatch_relative_attention_fmt<0>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, stream);
+        dispatch_relative_attention_fmt<0>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, d_pos, page_table, stream);
+    }
+}
+
+template <int KV_FMT, int MAX_W>
+static void dispatch_tc_attn_batched_w(
+    const float* qrgs, const __nv_bfloat16* rel_proj,
+    const void* k_cache, const void* v_cache,
+    const __half* k_scale, const __half* v_scale,
+    float* split_buf, float* out_gated, __half* out_gated_h,
+    int kv_cap, int window, int B, int num_seqs,
+    const BatchSeqMeta* d_seq_meta, const BatchTokenMeta* d_tok_meta,
+    const int32_t* d_page_table, int ctx_bucket, cudaStream_t stream) {
+    constexpr int BULK_THREADS  = (GQA_RATIO * MAX_W > 16) ? 128 : 64;
+    constexpr int LOCAL_THREADS = (GQA_RATIO * MAX_W > 16) ? 256 : 128;
+    if (window == 0 && ctx_bucket >= 2) {
+        launch_pdl(global_attn_bulk_splitk_batched_kernel<KV_FMT, MAX_W>,
+            dim3(NUM_KV_HEADS, KV_SPLIT_K, num_seqs), BULK_THREADS, stream,
+            qrgs, k_cache, v_cache, k_scale, v_scale, kv_cap, d_seq_meta, d_page_table, split_buf);
+    }
+    const int loc_splits = (ctx_bucket == 0) ? 4 : KV_LOCAL_SPLITS;
+    launch_pdl(local_tail_attn_tc_batched_kernel<KV_FMT, MAX_W>,
+        dim3(NUM_KV_HEADS, loc_splits, num_seqs), LOCAL_THREADS, stream,
+        qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, kv_cap, window, d_seq_meta,
+        (window == 0) ? d_page_table : nullptr, split_buf);
+    launch_pdl(attn_merge_sink_gate_batched_kernel, dim3(NUM_HEADS, B), HEAD_DIM, stream,
+        qrgs, split_buf, out_gated, out_gated_h, window, d_seq_meta, d_tok_meta);
+}
+
+template <int KV_FMT>
+static void dispatch_relative_attention_batched_fmt(
+    const float* qrgs, const __nv_bfloat16* rel_proj,
+    const void* k_cache, const void* v_cache,
+    const __half* k_scale, const __half* v_scale,
+    float* split_buf, float* out_gated, __half* out_gated_h,
+    int kv_cap, int window, int B, int num_seqs, int max_seq_width,
+    const BatchSeqMeta* d_seq_meta, const BatchTokenMeta* d_tok_meta,
+    const int32_t* d_page_table, int ctx_bucket, cudaStream_t stream) {
+    if (max_seq_width <= 1) {
+        dispatch_tc_attn_batched_w<KV_FMT, 1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, num_seqs, d_seq_meta, d_tok_meta, d_page_table, ctx_bucket, stream);
+    } else if (max_seq_width <= 2) {
+        dispatch_tc_attn_batched_w<KV_FMT, 2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, num_seqs, d_seq_meta, d_tok_meta, d_page_table, ctx_bucket, stream);
+    } else if (max_seq_width <= 4) {
+        dispatch_tc_attn_batched_w<KV_FMT, 4>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, num_seqs, d_seq_meta, d_tok_meta, d_page_table, ctx_bucket, stream);
+    } else {
+        dispatch_tc_attn_batched_w<KV_FMT, 8>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, num_seqs, d_seq_meta, d_tok_meta, d_page_table, ctx_bucket, stream);
+    }
+}
+
+void launch_relative_attention_gated_batched(
+    const float* qrgs, const __nv_bfloat16* rel_proj,
+    const void* k_cache, const void* v_cache,
+    const __half* k_scale, const __half* v_scale,
+    KVFormat kv_fmt, float* split_buf, float* out_gated, __half* out_gated_h,
+    int kv_cap, int window, int B, int num_seqs, int max_seq_width,
+    const BatchSeqMeta* d_seq_meta, const BatchTokenMeta* d_tok_meta,
+    const int32_t* d_page_table, cudaStream_t stream, int ctx_bucket) {
+    if (kv_fmt == KVFormat::FP8) {
+        dispatch_relative_attention_batched_fmt<1>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, num_seqs, max_seq_width, d_seq_meta, d_tok_meta, d_page_table, ctx_bucket, stream);
+    } else if (kv_fmt == KVFormat::Q4) {
+        dispatch_relative_attention_batched_fmt<2>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, num_seqs, max_seq_width, d_seq_meta, d_tok_meta, d_page_table, ctx_bucket, stream);
+    } else {
+        dispatch_relative_attention_batched_fmt<0>(qrgs, rel_proj, k_cache, v_cache, k_scale, v_scale, split_buf, out_gated, out_gated_h, kv_cap, window, B, num_seqs, max_seq_width, d_seq_meta, d_tok_meta, d_page_table, ctx_bucket, stream);
     }
 }
 
@@ -2806,19 +3319,20 @@ void launch_mega_global_sconv_prep_store(
     float* k_ring, float* v_ring,
     const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
     void* k_cache, void* v_cache, __half* k_scale, __half* v_scale, KVFormat kv_fmt,
-    int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream) {
+    int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream,
+    const BatchTokenMeta* tok_meta, const int32_t* page_table) {
     if (kv_fmt == KVFormat::FP8) {
         launch_pdl(mega_global_sconv_prep_store_kernel<1>, dim3(64, B), 128, stream,
             qrgs, k_proj, v_proj, in_k, in_v, k_sconv_w, v_sconv_w, k_sconv_proj, v_sconv_proj,
-            k_ring, v_ring, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+            k_ring, v_ring, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos, tok_meta, page_table);
     } else if (kv_fmt == KVFormat::Q4) {
         launch_pdl(mega_global_sconv_prep_store_kernel<2>, dim3(64, B), 128, stream,
             qrgs, k_proj, v_proj, in_k, in_v, k_sconv_w, v_sconv_w, k_sconv_proj, v_sconv_proj,
-            k_ring, v_ring, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+            k_ring, v_ring, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos, tok_meta, page_table);
     } else {
         launch_pdl(mega_global_sconv_prep_store_kernel<0>, dim3(64, B), 128, stream,
             qrgs, k_proj, v_proj, in_k, in_v, k_sconv_w, v_sconv_w, k_sconv_proj, v_sconv_proj,
-            k_ring, v_ring, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos);
+            k_ring, v_ring, q_clip_scale, rel_clip_scale, k_cache, v_cache, k_scale, v_scale, kv_cap, d_pos, tok_meta, page_table);
     }
 }
 
@@ -2830,14 +3344,15 @@ void launch_mega_mlp_post_next_depth_norm(
     const __nv_bfloat16* norm0, const __nv_bfloat16* norm1, const __nv_bfloat16* norm2,
     float* out0, float* out1, float* out2, __half* out_h0, __half* out_h1, __half* out_h2,
     int n_out, int B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream,
+    const BatchTokenMeta* tok_meta) {
     BF16Ptr3 np{{norm0, norm1, norm2}};
     MutPtr3 op{{out0, out1, out2}};
     HalfPtr3 ohp{{out_h0, out_h1, out_h2}};
     launch_pdl(mega_mlp_post_next_depth_norm_kernel, dim3(B, n_out), 576, stream,
         moe_down_or_slots, moe_is_slotted, prev_mlp_sconv_w, prev_mlp_ring, residual, hidden_out,
         pre_tap_out, post_tap_out, partial_out, blocks, n_blocks, queries, np, op, ohp, d_pos,
-        abl_r, abl_d, abl_p);
+        abl_r, abl_d, abl_p, tok_meta);
 }
 
 void launch_mega_local_sconv_prep_store(
@@ -2845,10 +3360,11 @@ void launch_mega_local_sconv_prep_store(
     const __nv_bfloat16* k_sconv_w, const __nv_bfloat16* v_sconv_w,
     float* k_ring, float* v_ring,
     const __nv_bfloat16* q_clip_scale, const __nv_bfloat16* rel_clip_scale,
-    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream) {
+    __nv_bfloat16* k_cache, __nv_bfloat16* v_cache, int kv_cap, int B, const int32_t* d_pos, cudaStream_t stream,
+    const BatchTokenMeta* tok_meta) {
     launch_pdl(mega_local_sconv_prep_store_kernel, dim3(64, B), 128, stream,
         qrgs, k_proj, v_proj, k_sconv_w, v_sconv_w, k_ring, v_ring,
-        q_clip_scale, rel_clip_scale, k_cache, v_cache, kv_cap, d_pos);
+        q_clip_scale, rel_clip_scale, k_cache, v_cache, kv_cap, d_pos, tok_meta);
 }
 
 void launch_mega_attn_post_mlp_in(
@@ -2856,19 +3372,21 @@ void launch_mega_attn_post_mlp_in(
     const float* hidden, const float* partial_prev, float* blocks, int block_count_before, bool is_boundary,
     float* residual_out, const float* mlp_query, const __nv_bfloat16* mlp_norm_w,
     float* mlp_out, __half* mlp_out_h, int B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream,
+    const BatchTokenMeta* tok_meta) {
     launch_pdl(mega_attn_post_mlp_in_kernel, dim3(B), 576, stream,
         o_proj, attn_sconv_w, attn_ring, hidden, partial_prev, blocks, block_count_before, is_boundary,
-        residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos, abl_r, abl_d, abl_p);
+        residual_out, mlp_query, mlp_norm_w, mlp_out, mlp_out_h, d_pos, abl_r, abl_d, abl_p, tok_meta);
 }
 
 void launch_mega_mlp_post_res(
     const float* moe_down_or_slots, bool moe_is_slotted, const __nv_bfloat16* mlp_sconv_w, float* mlp_ring,
     const float* residual, float* hidden_out, int B, const int32_t* d_pos,
-    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream) {
+    const float* abl_r, const float* abl_d, const float* abl_p, cudaStream_t stream,
+    const BatchTokenMeta* tok_meta) {
     launch_pdl(mega_mlp_post_res_kernel, dim3(B), 576, stream,
         moe_down_or_slots, moe_is_slotted, mlp_sconv_w, mlp_ring, residual, hidden_out, d_pos,
-        abl_r, abl_d, abl_p);
+        abl_r, abl_d, abl_p, tok_meta);
 }
 
 void launch_vec_add(const float* a, const float* b, float* out, int n, cudaStream_t stream) {

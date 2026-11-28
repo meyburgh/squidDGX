@@ -455,6 +455,11 @@ struct Engine {
     int32_t* d_vis_src = nullptr;
 
     bool init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFormat kv_fmt, uint32_t batch_slots = 1);
+    // Runtime arena bytes init() would allocate for this context/KV/slot configuration.
+    static uint64_t runtime_vram_bytes_for(const LoadedModel* loaded, uint32_t max_ctx, KVFormat kv_fmt, uint32_t batch_slots);
+    // Largest context <= max_ctx (multiple of 4096 tokens, >= 4096) whose runtime arena fits in the
+    // device memory left after weights; 0 if even 4096 tokens does not fit.
+    static uint32_t fit_context_tokens(const LoadedModel* loaded, uint32_t max_ctx, KVFormat kv_fmt, uint32_t batch_slots);
     void deinit();
     void reset();
     void enable_prefix_cache(uint32_t parked_sessions = 3);

@@ -6,9 +6,27 @@ BUILD_DIR := build
 TARGET    := $(BUILD_DIR)/squidDGX
 TEST_BIN  := $(BUILD_DIR)/test_unit
 
-CXXFLAGS  := -O3 -std=c++20 -mcpu=native -Icuda -Isrc -Ithird_party -I$(CUDA_PATH)/include \
+# GPU targets (space-separated SM numbers; an "a" suffix selects the arch-specific
+# target needed for hardware FP4 conversion). Defaults cover:
+#   86   A10G, RTX A-series          89   L4, L40S, RTX 6000 Ada
+#   90   H100, H200                  120a RTX PRO 4500/6000 Blackwell, RTX 50xx
+#   121a DGX Spark (GB10)
+# Build only what you need for faster compiles, e.g. `make CUDA_ARCHS=89`.
+CUDA_ARCHS ?= 86 89 90 120a 121a
+GENCODE   := $(foreach a,$(CUDA_ARCHS),-gencode arch=compute_$(a),code=sm_$(a))
+
+# Host CPU flags: native on ARM64 (Spark builds in place), portable AVX2 baseline on x86-64
+# so an image built on one cloud host runs on another. Override with HOST_ARCH_FLAGS=...
+UNAME_M   := $(shell uname -m)
+ifeq ($(UNAME_M),aarch64)
+HOST_ARCH_FLAGS ?= -mcpu=native
+else
+HOST_ARCH_FLAGS ?= -march=x86-64-v3
+endif
+
+CXXFLAGS  := -O3 -std=c++20 $(HOST_ARCH_FLAGS) -Icuda -Isrc -Ithird_party -I$(CUDA_PATH)/include \
              -Wall -Wextra -Wno-unused-parameter -fno-exceptions -fno-rtti
-NVCCFLAGS := -O3 --use_fast_math -std=c++20 -gencode arch=compute_121a,code=sm_121a \
+NVCCFLAGS := -O3 --use_fast_math -std=c++20 $(GENCODE) --threads 0 \
              --expt-relaxed-constexpr -Icuda
 LDFLAGS   := -L$(CUDA_PATH)/lib64 -lcudart -lcublas -lwebp -lcurl -lpthread -lm
 

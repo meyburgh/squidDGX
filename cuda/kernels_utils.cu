@@ -497,4 +497,38 @@ void launch_assemble_batched_verify_tokens(
         d_seq_meta, num_seqs, d_slot_anchors, d_slot_drafts, d_out_tokens, d_out_draft_tokens);
 }
 
+namespace {
+__global__ void arch_probe_kernel() {}
+} // namespace
+
+bool check_gpu_supported() {
+    int dev = 0;
+    cudaDeviceProp prop{};
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+        fprintf(stderr, "[gpu] No CUDA device available (driver missing or GPU not passed to the container?)\n");
+        return false;
+    }
+    printf("[gpu] %s | sm_%d%d | %d SMs | %.1f GiB %s\n", prop.name, prop.major, prop.minor,
+           prop.multiProcessorCount, static_cast<double>(prop.totalGlobalMem) / (1024.0 * 1024.0 * 1024.0),
+           prop.integrated ? "unified memory" : "VRAM");
+    if (prop.major < 8) {
+        fprintf(stderr, "[gpu] %s (sm_%d%d) is not supported: squidDGX needs compute capability 8.0+ "
+                        "(BF16 tensor cores, cp.async). Default build targets: A10G (sm_86), L4/L40S (sm_89), "
+                        "H100 (Hopper), RTX PRO Blackwell, DGX Spark.\n",
+                prop.name, prop.major, prop.minor);
+        return false;
+    }
+    cudaFuncAttributes attr{};
+    const cudaError_t err = cudaFuncGetAttributes(&attr, arch_probe_kernel);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "[gpu] This build has no kernels for sm_%d%d (%s). Rebuild with "
+                        "CUDA_ARCHS including %d%d%s (docker build --build-arg CUDA_ARCHS=...).\n",
+                prop.major, prop.minor, cudaGetErrorString(err), prop.major, prop.minor,
+                prop.major >= 10 ? "a" : "");
+        return false;
+    }
+    return true;
+}
+
 } // namespace squid

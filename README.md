@@ -1,7 +1,9 @@
 # squidDGX
 
 A pure C++20 + CUDA inference engine and OpenAI-compatible HTTP/SSE server for
-Inkling-2-Mini on NVIDIA DGX Spark (GB10, `sm_121a`, Linux ARM64). It serves one
+Inkling-2-Mini on NVIDIA DGX Spark (GB10, `sm_121a`, Linux ARM64) and discrete
+NVIDIA GPUs (A10G, L40S, H100, RTX PRO 4500/6000 Blackwell; see
+[Supported GPUs](#supported-gpus)). It serves one
 request at a time, defaults to NVFP4 weights with a BF16 KV cache
 (`--mode nvfp4 --kv bf16`), a 262,144-token context window, and a 65,536-token
 output cap, and supports DSpark adaptive speculative decoding (`--mtp 7`).
@@ -42,6 +44,41 @@ docker run --rm --gpus all --memory=96000000000 --memory-swap=96000000000 \
   The Docker flags above enforce a 96 GB cgroup limit with zero swap, and the
   engine verifies available memory before allocating its single-arena CUDA
   weight and runtime buffers (reserving 4 GiB for CUDA/host overhead).
+
+### Supported GPUs
+
+The default image contains kernels for all of these. Build a single target with
+`docker build --build-arg CUDA_ARCHS=90 -t squiddgx .` for a faster compile.
+
+| GPU | `CUDA_ARCHS` | Memory | Default context (`serve`, `--kv bf16`) |
+|---|---|---:|---|
+| DGX Spark (GB10) | `121a` | 128 GB unified | 262K |
+| RTX PRO 6000 Blackwell | `120a` | 96 GB | 262K |
+| RTX PRO 4500 Blackwell | `120a` | 32 GB | 262K |
+| H100 | `90` | 80 GB | 262K |
+| L40S | `89` | 48 GB | 262K |
+| A10G | `86` | 24 GB | ~100K (auto-reduced) |
+
+- Blackwell decodes NVFP4 weights in hardware. Ampere/Ada/Hopper use a
+  bit-exact software decode, which is slower (~40% lower single-stream decode
+  on the same GPU). Hopper and Blackwell also use programmatic dependent launch.
+- T4 (and anything below compute capability 8.0) is not supported. The NVFP4
+  weights alone (~15 GiB with MTP and vision) fill a 16 GB T4, and the kernels
+  need BF16 tensor cores and `cp.async`.
+- On discrete GPUs, the default `--ctx 262144` is shrunk to the largest
+  context that fits in free VRAM, keeping 1 GiB in reserve
+  (`SQUID_VRAM_RESERVE_MIB` overrides this). An explicit `--ctx` is never
+  shrunk; it fails with the memory shortfall instead. `--kv fp8` or `--kv q4`
+  fits roughly 2x or 4x more context.
+- CUDA 13 needs NVIDIA driver 580 or newer on the host.
+- The 96 GB `--memory` flags above are only for the Spark's unified memory. On
+  a discrete GPU, run:
+
+```sh
+docker run --rm --gpus all \
+  --mount "type=bind,source=$MODEL_DIR,target=/model,readonly" \
+  -p 127.0.0.1:8000:8000 squiddgx serve /model
+```
 
 ## Benchmarks
 

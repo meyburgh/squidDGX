@@ -156,6 +156,7 @@ int main(int argc, char** argv) {
     uint32_t max_tokens = (command == "bench") ? 128u : 65536u;
     uint32_t runs = 6;
     uint32_t ctx = 262144u;
+    bool ctx_explicit = false;
     bool use_graphs = true;
     bool use_prompt_lookup = true;
     bool raw_prompt = false;
@@ -232,6 +233,7 @@ int main(int argc, char** argv) {
             runs = static_cast<uint32_t>(std::strtoul(argv[++arg_i], nullptr, 10));
         } else if (arg == "--ctx" && has_val()) {
             ctx = static_cast<uint32_t>(std::strtoul(argv[++arg_i], nullptr, 10));
+            ctx_explicit = true;
         } else if (arg == "--no-graph") { use_graphs = false; }
         else if (arg == "--no-prompt-lookup") { use_prompt_lookup = false; }
         else if (arg == "--raw") { raw_prompt = true; }
@@ -390,6 +392,13 @@ int main(int argc, char** argv) {
 
     if (!ablation_path.empty() && !model_name_explicit) model_name = "inkling-2-mini-abliterated";
 
+    if (!squid::check_gpu_supported()) {
+        squid::free_host(prompt_ids_buf);
+        if (need_tokenizer) tokenizer.deinit();
+        squid::free_host(prompt_file_buf);
+        return 1;
+    }
+
     squid::LoadedModel model{};
     const bool load_mtp = (mtp > 0 || command == "longctx" || command == "serve");
     if (!model.load(model_directory, quant_mode, load_mtp, ablation_path)) {
@@ -397,6 +406,28 @@ int main(int argc, char** argv) {
         if (need_tokenizer) tokenizer.deinit();
         squid::free_host(prompt_file_buf);
         return 1;
+    }
+
+    if (!ctx_explicit) {
+        // Default 262K context: shrink to what fits beside the weights (24-48 GB GPUs).
+        const uint32_t fitted = squid::Engine::fit_context_tokens(&model, ctx, kv_format, max_batch_slots);
+        if (fitted == 0) {
+            fprintf(stderr, "[memory] Not enough GPU memory for the runtime buffers even at a 4096-token context "
+                            "(try --kv q4, --max-batch 1 or --mode nvfp4)\n");
+        } else if (fitted < ctx) {
+            printf("[memory] Context reduced from %u to %u tokens to fit GPU memory (pass --ctx to override, "
+                   "or --kv fp8 / --kv q4 for more)\n", ctx, fitted);
+            ctx = fitted;
+            if (is_prompt_cmd && prompt_len >= ctx) {
+                fprintf(stderr, "Prompt length %zu exceeds the %u-token context that fits in GPU memory\n",
+                        prompt_len, ctx);
+                model.deinit();
+                squid::free_host(prompt_ids_buf);
+                if (need_tokenizer) tokenizer.deinit();
+                squid::free_host(prompt_file_buf);
+                return 1;
+            }
+        }
     }
 
     squid::Engine engine{};

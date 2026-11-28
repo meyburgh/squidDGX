@@ -285,6 +285,31 @@ cudaGraphExec_t end_capture_and_instantiate(cudaStream_t stream) {
 
 } // namespace
 
+uint64_t Engine::runtime_vram_bytes_for(const LoadedModel* loaded, uint32_t max_ctx, KVFormat kv_fmt, uint32_t batch_slots) {
+    SQUID_ASSERT(loaded != nullptr);
+    VisitInfo sched[NUM_VISITS];
+    build_visit_schedule(sched);
+    const uint32_t slots = std::clamp<uint32_t>(batch_slots, 1u, static_cast<uint32_t>(MAX_BATCH_SLOTS));
+    const uint32_t ds_slots = std::min<uint32_t>(slots, static_cast<uint32_t>(MAX_DSPARK_SLOTS));
+    const bool has_dspark = loaded->mw.dspark.loaded;
+    const uint64_t draft_vocab_count = has_dspark ? static_cast<uint64_t>(loaded->mw.dspark.draft_vocab_size) : 0;
+    return compute_runtime_vram_bytes(sched, max_ctx, slots, ds_slots, kv_fmt, has_dspark, draft_vocab_count,
+                                      compute_dspark_ws_floats(loaded->mw));
+}
+
+uint32_t Engine::fit_context_tokens(const LoadedModel* loaded, uint32_t max_ctx, KVFormat kv_fmt, uint32_t batch_slots) {
+    constexpr uint32_t kStep = 4096;
+    const uint64_t budget = device_allocatable_bytes(loaded->arena.capacity_bytes);
+    if (runtime_vram_bytes_for(loaded, max_ctx, kv_fmt, batch_slots) <= budget) return max_ctx;
+    uint32_t lo = 0, hi = max_ctx / kStep; // invariant: lo steps fit (0 == none), hi steps do not
+    if (runtime_vram_bytes_for(loaded, hi * kStep, kv_fmt, batch_slots) <= budget) return hi * kStep;
+    while (hi - lo > 1) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (runtime_vram_bytes_for(loaded, mid * kStep, kv_fmt, batch_slots) <= budget) lo = mid; else hi = mid;
+    }
+    return lo * kStep;
+}
+
 bool Engine::init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFormat kv_fmt, uint32_t batch_slots) {
     SQUID_ASSERT(loaded != nullptr);
     SQUID_ASSERT(max_ctx >= 64);
@@ -307,7 +332,7 @@ bool Engine::init(const LoadedModel* loaded, uint32_t max_ctx, bool graphs, KVFo
     const uint64_t runtime_bytes = compute_runtime_vram_bytes(
         schedule, context_tokens_max, max_batch_slots, max_dspark_slots,
         kv_format, has_dspark, draft_vocab_count, dspark_ws_floats);
-    if (!check_spark_memory(loaded->arena.capacity_bytes, runtime_bytes)) return false;
+    if (!check_device_memory(loaded->arena.capacity_bytes, runtime_bytes)) return false;
 
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     CUDA_CHECK(cudaStreamCreateWithFlags(&aux_stream, cudaStreamNonBlocking));

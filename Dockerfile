@@ -8,7 +8,10 @@ COPY third_party third_party
 COPY cuda cuda
 COPY src src
 COPY tests tests
-RUN make -j$(nproc) all test
+# GPU targets: 86=A10G 89=L4/L40S 90=H100 120a=RTX PRO Blackwell 121a=DGX Spark.
+# Narrow it for a faster build, e.g. --build-arg CUDA_ARCHS=90
+ARG CUDA_ARCHS="86 89 90 120a 121a"
+RUN make -j$(nproc) CUDA_ARCHS="$CUDA_ARCHS" all test
 HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fs http://127.0.0.1:8000/health >/dev/null && curl -fs http://127.0.0.1:8897/health >/dev/null
 ENTRYPOINT ["/src/build/squidDGX"]

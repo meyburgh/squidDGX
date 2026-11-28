@@ -1,6 +1,6 @@
 #pragma once
 
-// TigerStyle single-allocation VRAM bump arena & Spark unified memory guard.
+// TigerStyle single-allocation VRAM bump arena & device memory guard (Spark unified memory or discrete VRAM).
 // One contiguous cudaMalloc per lifetime, 256-byte alignment, exact Pass1==Pass2 accounting.
 
 #include "config.hpp"
@@ -96,6 +96,65 @@ inline bool check_spark_memory(uint64_t resident_bytes, uint64_t new_bytes) {
         fprintf(stderr, "[memory] Need %llu MiB of available Spark memory, found %llu MiB\n",
                 static_cast<unsigned long long>(needed_bytes / (1024 * 1024)),
                 static_cast<unsigned long long>(avail_bytes / (1024 * 1024)));
+        return false;
+    }
+    return true;
+}
+
+// Discrete GPUs keep this much VRAM free for the CUDA context, cuBLAS, CUDA graphs and the
+// vision encoder's per-request workspace. Override with SQUID_VRAM_RESERVE_MIB.
+constexpr uint64_t DISCRETE_VRAM_RESERVE_BYTES = 1024ULL * 1024 * 1024;
+
+inline uint64_t discrete_vram_reserve_bytes() {
+    const char* env = std::getenv("SQUID_VRAM_RESERVE_MIB");
+    if (env && env[0]) {
+        char* endp = nullptr;
+        const unsigned long long mib = std::strtoull(env, &endp, 10);
+        if (endp != env) return static_cast<uint64_t>(mib) * 1024ULL * 1024ULL;
+    }
+    return DISCRETE_VRAM_RESERVE_BYTES;
+}
+
+// True when the GPU shares system DRAM with the CPU (DGX Spark GB10, Jetson).
+inline bool device_is_integrated() {
+    int dev = 0, integrated = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) return false;
+    return integrated != 0;
+}
+
+// Bytes that can still be allocated for new_bytes-style requests after the reserve.
+inline uint64_t device_allocatable_bytes(uint64_t resident_bytes) {
+    if (device_is_integrated()) {
+        uint64_t avail = 0;
+        if (!read_spark_available_memory(&avail)) return 0;
+        const uint64_t cap_left = (resident_bytes + SPARK_MEMORY_RESERVE_BYTES < SPARK_MEMORY_LIMIT_BYTES)
+                                      ? SPARK_MEMORY_LIMIT_BYTES - resident_bytes - SPARK_MEMORY_RESERVE_BYTES : 0;
+        const uint64_t avail_left = avail > SPARK_MEMORY_RESERVE_BYTES ? avail - SPARK_MEMORY_RESERVE_BYTES : 0;
+        return cap_left < avail_left ? cap_left : avail_left;
+    }
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    const uint64_t reserve = discrete_vram_reserve_bytes();
+    return free_b > reserve ? static_cast<uint64_t>(free_b) - reserve : 0;
+}
+
+// resident_bytes: device memory this process already holds (only used for the Spark 96 GB cap;
+// on discrete GPUs cudaMemGetInfo already reflects it).
+inline bool check_device_memory(uint64_t resident_bytes, uint64_t new_bytes) {
+    if (device_is_integrated()) return check_spark_memory(resident_bytes, new_bytes);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        fprintf(stderr, "[memory] cudaMemGetInfo failed\n");
+        return false;
+    }
+    const uint64_t needed_bytes = new_bytes + discrete_vram_reserve_bytes();
+    if (needed_bytes > free_b) {
+        fprintf(stderr, "[memory] Need %llu MiB of free VRAM (incl. %llu MiB reserve), found %llu MiB of %llu MiB\n",
+                static_cast<unsigned long long>(needed_bytes / (1024 * 1024)),
+                static_cast<unsigned long long>(discrete_vram_reserve_bytes() / (1024 * 1024)),
+                static_cast<unsigned long long>(free_b / (1024 * 1024)),
+                static_cast<unsigned long long>(total_b / (1024 * 1024)));
         return false;
     }
     return true;

@@ -881,13 +881,13 @@ void Tokenizer::pretokenize_and_encode_chunk(
     if (text.empty() || out_len >= output_cap) return;
     SQUID_ASSERT(text.size() <= SCRATCH_CODEPOINTS_MAX);
 
-    const auto* p = reinterpret_cast<const uint8_t*>(text.data());
     uint32_t* cps = scratch.codepoints;
     uint32_t* offs = scratch.byte_offsets;
     size_t cp_count = 0;
     size_t bp = 0;
 
 #if defined(__aarch64__)
+    const auto* p = reinterpret_cast<const uint8_t*>(text.data());
     static constexpr uint32_t kLane0[4] = {0, 1, 2, 3};
     static constexpr uint32_t kLane1[4] = {4, 5, 6, 7};
     static constexpr uint32_t kLane2[4] = {8, 9, 10, 11};

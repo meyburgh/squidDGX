@@ -39,6 +39,18 @@ __device__ __forceinline__ void pdl_trigger() {
 #endif
 }
 
+// Programmatic dependent launch needs compute capability 9.0+ (H100, Blackwell). On older GPUs
+// (A10G, L40S) the launch is a plain stream-ordered launch and pdl_wait/pdl_trigger compile to no-ops.
+inline bool device_supports_pdl() {
+    static const bool supported = [] {
+        int dev = 0, major = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+        return major >= 9;
+    }();
+    return supported;
+}
+
 template <class... KArgs, class... Args>
 inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, int block, cudaStream_t stream, Args&&... args) {
     cudaLaunchConfig_t cfg = {};
@@ -49,7 +61,7 @@ inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, int block, cudaStrea
     attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
-    cfg.numAttrs = 1;
+    cfg.numAttrs = device_supports_pdl() ? 1 : 0;
     CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, static_cast<KArgs>(args)...));
 }
 
@@ -116,23 +128,36 @@ __device__ __forceinline__ void mma_m16n8k16_f32_bf16(
           "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 
-// Hardware GB10 PTX FP4 (e2m1x2) -> half2 conversion!
+// cvt.*.e2m1x2 exists only on arch/family-specific Blackwell targets (sm_100a, sm_120a, sm_121a, ...);
+// plain sm_120 PTX and pre-Blackwell GPUs take the software decode below.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
+#define SQUID_HW_FP4_CVT 1
+#else
+#define SQUID_HW_FP4_CVT 0
+#endif
+
+// Software e2m1x2 decode for GPUs without cvt.e2m1x2. Placing the nibble's 3 magnitude bits at
+// FP16 bits [11:9] (2 exponent bits + 1 mantissa bit) and its sign at bit 15 yields exactly
+// value * 2^-14 (code 1 lands on the FP16 subnormal 2^-15), so one HMUL2 by 2^14 restores
+// {0, 0.5, 1, 1.5, 2, 3, 4, 6} with sign. Low nibble -> low half, high nibble -> high half.
+__device__ __forceinline__ uint32_t e2m1x2_bits_to_half2_scaled(uint32_t t) {
+    return ((t << 9) & 0x00000E00u) | ((t << 12) & 0x00008000u) |
+           ((t << 21) & 0x0E000000u) | ((t << 24) & 0x80000000u);
+}
+
+// Hardware Blackwell PTX FP4 (e2m1x2) -> half2 conversion!
 // Single-instruction hardware decode on Blackwell (zero LUT / bitshift overhead).
 __device__ __forceinline__ __half2 cvt_e2m1x2_to_half2(uint32_t byte_val) {
     uint32_t out;
-#if __CUDA_ARCH__ >= 1000
+#if SQUID_HW_FP4_CVT
     uint16_t tmp = static_cast<uint16_t>(byte_val);
     asm("{ .reg .b8 b0, b1;\n"
         "  mov.b16 {b0, b1}, %1;\n"
         "  cvt.rn.f16x2.e2m1x2 %0, b0; }\n"
         : "=r"(out) : "h"(tmp));
 #else
-    static constexpr float lut[16] = {
-        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
-    };
-    __half2 h = __floats2half2_rn(lut[byte_val & 0xFu], lut[(byte_val >> 4) & 0xFu]);
-    out = *reinterpret_cast<uint32_t*>(&h);
+    out = e2m1x2_bits_to_half2_scaled(byte_val);
+    return __hmul2(*reinterpret_cast<__half2*>(&out), __half2half2(__ushort_as_half(0x7400u))); // x 2^14
 #endif
     return *reinterpret_cast<__half2*>(&out);
 }
@@ -140,7 +165,7 @@ __device__ __forceinline__ __half2 cvt_e2m1x2_to_half2(uint32_t byte_val) {
 // Unpack 8 FP4 weights (1 uint32) into 4x half2 with ZERO shifts/masks on GB10.
 __device__ __forceinline__ void cvt_e2m1x8_to_half2x4(
     uint32_t w, __half2& h0, __half2& h1, __half2& h2, __half2& h3) {
-#if __CUDA_ARCH__ >= 1000
+#if SQUID_HW_FP4_CVT
     uint32_t r0, r1, r2, r3;
     asm("{ .reg .b8 b0, b1, b2, b3;\n"
         "  mov.b32 {b0, b1, b2, b3}, %4;\n"
@@ -154,10 +179,15 @@ __device__ __forceinline__ void cvt_e2m1x8_to_half2x4(
     h2 = *reinterpret_cast<__half2*>(&r2);
     h3 = *reinterpret_cast<__half2*>(&r3);
 #else
-    h0 = cvt_e2m1x2_to_half2(w & 0xFFu);
-    h1 = cvt_e2m1x2_to_half2((w >> 8) & 0xFFu);
-    h2 = cvt_e2m1x2_to_half2((w >> 16) & 0xFFu);
-    h3 = cvt_e2m1x2_to_half2((w >> 24) & 0xFFu);
+    const __half2 k = __half2half2(__ushort_as_half(0x7400u)); // 2^14
+    uint32_t r0 = e2m1x2_bits_to_half2_scaled(w);
+    uint32_t r1 = e2m1x2_bits_to_half2_scaled(w >> 8);
+    uint32_t r2 = e2m1x2_bits_to_half2_scaled(w >> 16);
+    uint32_t r3 = e2m1x2_bits_to_half2_scaled(w >> 24);
+    h0 = __hmul2(*reinterpret_cast<__half2*>(&r0), k);
+    h1 = __hmul2(*reinterpret_cast<__half2*>(&r1), k);
+    h2 = __hmul2(*reinterpret_cast<__half2*>(&r2), k);
+    h3 = __hmul2(*reinterpret_cast<__half2*>(&r3), k);
 #endif
 }
 

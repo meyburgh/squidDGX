@@ -836,4 +836,8 @@ void launch_scatter_vision_embeds(
     int n_slots,
     cudaStream_t stream);
 
+// Checks that the current GPU is supported and that this binary contains kernels for it.
+// Prints the device summary (or a fix-it message) and returns false on failure.
+bool check_gpu_supported();
+
 } // namespace squid

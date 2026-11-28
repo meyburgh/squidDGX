@@ -641,7 +641,7 @@ bool LoadedModel::load(
         has_pruned_draft_vocab, draft_vocab_count, has_ablation, has_ablation_detectors);
     constexpr uint64_t kStageBytes = 96ULL * 1024 * 1024;
     const uint64_t fold_temp_bytes = has_mtp ? (static_cast<uint64_t>(draft_vocab_count) * MTP_MARKOV_RANK * 2 + 2ULL * 1024 * 1024) : 0;
-    if (!check_spark_memory(0, total_vram_bytes + kStageBytes + fold_temp_bytes)) {
+    if (!check_device_memory(0, total_vram_bytes + kStageBytes + fold_temp_bytes)) {
         if (draft_vocab_host) free_host(draft_vocab_host);
         if (has_ablation) sf_abl.close_file();
         if (has_mtp) sf_mtp.close_file();
